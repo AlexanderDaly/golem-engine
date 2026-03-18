@@ -9,9 +9,10 @@ use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
 
 use golem_engine::core_math::ramanujan_gen::{
-    generate_verified_regular_graph, GraphGenerationError, VerifiedRamanujanGraph,
+    generate_verified_regular_graph, recommended_seed_search_limit, GraphGenerationError,
+    VerifiedRamanujanGraph,
 };
-use golem_engine::data::mnist_loader::{MnistDataset, MnistLoadError};
+use golem_engine::data::mnist_loader::{MnistDataset, MnistLoadError, MNIST_IMAGE_PIXELS};
 use golem_engine::ecs_runtime::checkpoint::{
     load_checkpoint_json, save_checkpoint_json, CheckpointError,
 };
@@ -25,11 +26,11 @@ use golem_engine::ecs_runtime::systems::{
     update_local_weights_forward_forward, update_nodes_forward_forward, ActivationKind,
     NodeUpdateError,
 };
-use golem_engine::{NODE_COUNT, REGULAR_DEGREE};
+use golem_engine::REGULAR_DEGREE;
 
 const DEFAULT_EPOCHS: usize = 1;
 const DEFAULT_LEARNING_RATE: f32 = 1.0e-3;
-const DEFAULT_GRAPH_SEARCH_LIMIT: u64 = 50_000;
+const DEFAULT_GRAPH_NODE_COUNT: usize = MNIST_IMAGE_PIXELS;
 const DEFAULT_WEIGHT_SEED: u64 = 0;
 const DEFAULT_WEIGHT_INIT_SCALE: f32 = 0.05;
 
@@ -61,21 +62,36 @@ fn run() -> Result<(), AppError> {
         println!("loading checkpoint from {}", path.display());
         load_checkpoint_json(path)?
     } else {
+        let graph_search_limit = config
+            .graph_search_limit
+            .unwrap_or_else(|| recommended_seed_search_limit(config.graph_node_count));
+        let input_node_count = training_input_node_count(config.graph_node_count);
         println!(
             "searching deterministic seeds for a verified {}-node, {}-regular Ramanujan graph (limit: {})",
-            NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit
+            config.graph_node_count,
+            REGULAR_DEGREE,
+            graph_search_limit
         );
-        let graph =
-            generate_verified_regular_graph(NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit)?;
+        let graph = generate_verified_regular_graph(
+            config.graph_node_count,
+            REGULAR_DEGREE,
+            graph_search_limit,
+        )?;
         println!(
-            "using graph from seed {} with second-largest |eigenvalue| {:.6} (bound {:.6})",
+            "using graph from seed {} with second-largest |eigenvalue| {:.6} (bound {:.6}); input_nodes={}",
             graph.certificate.search_seed,
             graph.certificate.second_largest_absolute_eigenvalue,
-            graph.certificate.ramanujan_bound
+            graph.certificate.ramanujan_bound,
+            input_node_count
         );
 
         (
-            build_training_world(&graph, config.weight_seed, config.weight_init_scale)?,
+            build_training_world(
+                &graph,
+                config.weight_seed,
+                config.weight_init_scale,
+                input_node_count,
+            )?,
             SimulationPhase::Positive,
         )
     };
@@ -98,12 +114,14 @@ fn run() -> Result<(), AppError> {
             })?;
 
     println!(
-        "starting training: epochs={} ticks_per_epoch={} total_ticks={} activation={} learning_rate={} weight_seed={} weight_init_scale={}",
+        "starting training: epochs={} ticks_per_epoch={} total_ticks={} activation={} learning_rate={} graph_node_count={} input_node_count={} weight_seed={} weight_init_scale={}",
         config.epochs,
         ticks_per_epoch,
         total_ticks,
         activation_name(config.activation_kind),
         config.learning_rate,
+        world.query::<&NodeState>().iter().count(),
+        world.query::<&InputNode>().iter().count(),
         config.weight_seed,
         config.weight_init_scale
     );
@@ -144,7 +162,8 @@ struct TrainingConfig {
     epochs: usize,
     learning_rate: f32,
     activation_kind: ActivationKind,
-    graph_search_limit: u64,
+    graph_node_count: usize,
+    graph_search_limit: Option<u64>,
     weight_seed: u64,
     weight_init_scale: f32,
     load_checkpoint: Option<PathBuf>,
@@ -164,7 +183,8 @@ impl TrainingConfig {
         let mut epochs = DEFAULT_EPOCHS;
         let mut learning_rate = DEFAULT_LEARNING_RATE;
         let mut activation_kind = ActivationKind::Tanh;
-        let mut graph_search_limit = DEFAULT_GRAPH_SEARCH_LIMIT;
+        let mut graph_node_count = DEFAULT_GRAPH_NODE_COUNT;
+        let mut graph_search_limit = None;
         let mut weight_seed = DEFAULT_WEIGHT_SEED;
         let mut weight_init_scale = DEFAULT_WEIGHT_INIT_SCALE;
         let mut load_checkpoint = None;
@@ -210,12 +230,25 @@ impl TrainingConfig {
                     activation_kind =
                         parse_activation_kind(argument_value(&remaining, &mut index)?)?;
                 }
+                "--graph-node-count" => {
+                    graph_node_count = parse_usize(
+                        argument_value(&remaining, &mut index)?,
+                        "--graph-node-count",
+                    )?;
+                    if graph_node_count == 0 {
+                        return Err(AppError::InvalidArgument {
+                            flag: "--graph-node-count",
+                            value: "0".to_owned(),
+                            reason: "must be greater than zero",
+                        });
+                    }
+                }
                 "--graph-search-limit" => {
-                    graph_search_limit = parse_u64(
+                    graph_search_limit = Some(parse_u64(
                         argument_value(&remaining, &mut index)?,
                         "--graph-search-limit",
-                    )?;
-                    if graph_search_limit == 0 {
+                    )?);
+                    if graph_search_limit == Some(0) {
                         return Err(AppError::InvalidArgument {
                             flag: "--graph-search-limit",
                             value: "0".to_owned(),
@@ -266,6 +299,7 @@ impl TrainingConfig {
             epochs,
             learning_rate,
             activation_kind,
+            graph_node_count,
             graph_search_limit,
             weight_seed,
             weight_init_scale,
@@ -390,17 +424,22 @@ fn build_training_world(
     graph: &VerifiedRamanujanGraph,
     weight_seed: u64,
     weight_init_scale: f32,
+    input_node_count: usize,
 ) -> Result<World, AppError> {
     let node_count = graph.certificate.node_count;
     let adjacency = build_adjacency_lists(node_count, &graph.edges)?;
     let mut world = World::new();
     let entities: Vec<Entity> = (0..node_count)
         .map(|node_index| {
-            world.spawn((
-                InputNode,
-                StableNodeIndex::new(node_index),
-                NodeState::new(0.0),
-            ))
+            if node_index < input_node_count {
+                world.spawn((
+                    InputNode,
+                    StableNodeIndex::new(node_index),
+                    NodeState::new(0.0),
+                ))
+            } else {
+                world.spawn((StableNodeIndex::new(node_index), NodeState::new(0.0)))
+            }
         })
         .collect();
     let mut rng = ChaCha8Rng::seed_from_u64(weight_seed);
@@ -429,6 +468,10 @@ fn build_training_world(
     }
 
     Ok(world)
+}
+
+fn training_input_node_count(graph_node_count: usize) -> usize {
+    graph_node_count.min(MNIST_IMAGE_PIXELS)
 }
 
 fn build_adjacency_lists(
@@ -500,7 +543,8 @@ Options:
   --epochs <N>               Number of training epochs to run (default: {DEFAULT_EPOCHS})
   --learning-rate <F32>      Forward-Forward local learning rate (default: {DEFAULT_LEARNING_RATE})
   --activation <NAME>        Node activation: tanh | relu | softsign (default: tanh)
-  --graph-search-limit <N>   Deterministic seed search budget for Ramanujan graph generation (default: {DEFAULT_GRAPH_SEARCH_LIMIT})
+  --graph-node-count <N>     Number of graph nodes to generate (default: {DEFAULT_GRAPH_NODE_COUNT})
+  --graph-search-limit <N>   Deterministic seed search budget for Ramanujan graph generation (default: recommended_seed_search_limit(graph_node_count))
   --weight-seed <N>          RNG seed for local weight initialization (default: {DEFAULT_WEIGHT_SEED})
   --weight-init-scale <F32>  Uniform half-range for initial weights (default: {DEFAULT_WEIGHT_INIT_SCALE})
   --load-checkpoint <PATH>   Restore a previously saved graph state instead of generating a new graph
@@ -508,10 +552,13 @@ Options:
   --help, -h                 Show this help text
 
 Training schedule per tick:
-  inject_data_system -> update_nodes_forward_forward -> update_local_weights_forward_forward
+    inject_data_system -> update_nodes_forward_forward -> update_local_weights_forward_forward
 
 Epoch semantics:
-  one epoch runs 2 * dataset_len ticks so both the positive and negative cursors traverse the full dataset once."
+  one epoch runs 2 * dataset_len ticks so both the positive and negative cursors traverse the full dataset once.
+
+Input semantics:
+  the first min(graph_node_count, 784) nodes are tagged as InputNode, so 784-node graphs use direct one-pixel-per-node MNIST injection by default."
     );
 }
 
@@ -540,6 +587,8 @@ mod tests {
         );
         assert_eq!(config.epochs, DEFAULT_EPOCHS);
         assert_eq!(config.learning_rate, DEFAULT_LEARNING_RATE);
+        assert_eq!(config.graph_node_count, DEFAULT_GRAPH_NODE_COUNT);
+        assert_eq!(config.graph_search_limit, None);
         assert!(matches!(config.activation_kind, ActivationKind::Tanh));
     }
 
@@ -577,5 +626,18 @@ mod tests {
 
         assert_eq!(config.load_checkpoint, Some(PathBuf::from("input.json")));
         assert_eq!(config.save_checkpoint, Some(PathBuf::from("output.json")));
+    }
+
+    #[test]
+    fn training_input_node_count_caps_at_mnist_pixels() {
+        assert_eq!(training_input_node_count(100), 100);
+        assert_eq!(
+            training_input_node_count(MNIST_IMAGE_PIXELS),
+            MNIST_IMAGE_PIXELS
+        );
+        assert_eq!(
+            training_input_node_count(MNIST_IMAGE_PIXELS + 64),
+            MNIST_IMAGE_PIXELS
+        );
     }
 }

@@ -1,10 +1,10 @@
 # Golem Engine
 
-Golem Engine is the Rust core for Project Sephirot, a toy decentralized learning system built around a sparse asynchronous graph instead of dense backpropagation. The current implementation targets a fixed 100-node, 3-regular Ramanujan-style topology and an ECS runtime where each node updates from only its local neighborhood.
+Golem Engine is the Rust core for Project Sephirot, a toy decentralized learning system built around a sparse asynchronous graph instead of dense backpropagation. The current implementation targets configurable 3-regular Ramanujan-style topologies and an ECS runtime where each node updates from only its local neighborhood.
 
 This repository is intentionally narrow in scope. It focuses on the inspectable systems needed to bootstrap the architecture:
 
-- deterministic generation and validation of a `d = 3`, `n = 100` graph,
+- deterministic generation and validation of configurable `d = 3` regular graphs,
 - ECS-native node state and local update dynamics,
 - MNIST ingestion for Forward-Forward style contrastive training,
 - procedurally generated negative samples formed by hybridizing real digits.
@@ -20,7 +20,7 @@ This repository is intentionally narrow in scope. It focuses on the inspectable 
 
 ### 1. Ramanujan Graph Generation
 
-The graph generator in [`src/core_math/ramanujan_gen.rs`](/Users/alexanderdaly/Projects/golem-engine/src/core_math/ramanujan_gen.rs) builds candidate 3-regular graphs from edge-disjoint perfect matchings, validates simplicity and connectivity, and computes the adjacency spectrum directly with `nalgebra`. A graph is accepted only if it satisfies the current Ramanujan bound.
+The graph generator in [`src/core_math/ramanujan_gen.rs`](/Users/alexanderdaly/Projects/golem-engine/src/core_math/ramanujan_gen.rs) builds candidate 3-regular graphs from edge-disjoint perfect matchings, validates simplicity and connectivity, uses a matrix-free proxy filter for larger searches, and computes the exact adjacency spectrum with `nalgebra` for the candidates that survive. A graph is accepted only if it satisfies the current Ramanujan bound.
 
 ### 2. ECS Runtime
 
@@ -42,7 +42,7 @@ The data path is split into three pieces:
 
 ## Important Constraint
 
-MNIST images have 784 pixels, but the current graph has 100 scalar nodes. The ingestion system therefore projects contiguous spans of the flattened image onto the available input entities when fewer than 784 `InputNode`s are present. If the graph later exposes 784 input entities, the same system already supports direct one-pixel-per-node injection.
+MNIST images have 784 pixels, and the ingestion system switches behavior based on how many entities are tagged with `InputNode`. When fewer than 784 inputs are present, it projects contiguous spans of the flattened image by deterministic averaging. When at least 784 inputs are present, it already performs direct one-pixel-per-node injection. The training binary now defaults to a 784-node graph so MNIST runs can use the direct mapping path out of the box.
 
 ## Repository Layout
 
@@ -84,17 +84,19 @@ cargo run -- \
   --epochs 1 \
   --learning-rate 0.001 \
   --activation tanh \
+  --graph-node-count 784 \
   --save-checkpoint checkpoints/epoch-1.json
 ```
 
 Useful options:
 
-- `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph.
+- `--graph-node-count` controls the graph size. The binary defaults to `784`, which gives MNIST a direct one-pixel-per-node input surface.
+- `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph. If omitted, the default search budget scales with the requested node count.
 - `--weight-seed` and `--weight-init-scale` control the initial local weights attached to each node.
 - `--save-checkpoint` writes the final graph state, including weights, activations, and stable topology indices, to JSON.
 - `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
 
-The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags every current node as an `InputNode`, and runs the per-tick schedule:
+The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `min(graph_node_count, 784)` nodes as `InputNode`, and runs the per-tick schedule:
 
 1. `inject_data_system`
 2. `update_nodes_forward_forward`
@@ -144,6 +146,7 @@ The repo now includes the graph primitive, the data path, the asynchronous ECS p
 Implemented:
 
 - verified cubic graph search and spectral certification,
+- configurable graph sizes up through MNIST-scale direct input mapping,
 - ECS node model for graph-local asynchronous updates,
 - MNIST positive stream with native IDX parsing,
 - plausible negative generation via digit hybridization,

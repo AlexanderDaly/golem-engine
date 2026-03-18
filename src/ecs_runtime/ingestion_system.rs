@@ -7,10 +7,10 @@
 //! - any learning rule that scores positive vs. negative activations should execute after
 //!   the forward sweep completes.
 //!
-//! The current node state is scalar, so a 100-node graph cannot hold all 784 MNIST pixels
-//! losslessly in a single tick. This system therefore injects one pixel per node when
-//! there are 784 tagged input entities, and otherwise projects contiguous spans of the
-//! flattened image onto the available input nodes by deterministic averaging.
+//! The current node state is scalar, so the quality of the data path depends on how many
+//! entities are tagged as inputs. This system injects one pixel per node when there are at
+//! least 784 tagged input entities, and otherwise projects contiguous spans of the flattened
+//! image onto the available input nodes by deterministic averaging.
 
 use hecs::{Entity, World};
 use serde::{Deserialize, Serialize};

@@ -1,9 +1,9 @@
-//! Graph generation and validation for the fixed `d = 3`, `n = 100` toy model.
+//! Graph generation and validation for configurable `d = 3` regular graphs.
 //!
 //! The generator intentionally avoids any opaque external graph library:
 //! - candidates are created as the union of three edge-disjoint perfect matchings,
 //! - each candidate is checked for simplicity, regularity, and connectivity,
-//! - the adjacency spectrum is computed explicitly,
+//! - the adjacency spectrum is computed explicitly for the candidate that survives search,
 //! - the graph is accepted only when the second-largest eigenvalue by absolute value
 //!   is within the Ramanujan bound `2 * sqrt(d - 1)`.
 //!
@@ -14,6 +14,7 @@ use std::collections::{HashSet, VecDeque};
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -22,7 +23,13 @@ use thiserror::Error;
 use crate::{Edge, NODE_COUNT, REGULAR_DEGREE};
 
 const LOCAL_MATCHING_RETRIES: usize = 512;
-const DEFAULT_SEED_SEARCH_LIMIT: u64 = 50_000;
+const MINIMUM_SEED_SEARCH_LIMIT: u64 = 50_000;
+const DEFAULT_SEED_SEARCH_MULTIPLIER: u64 = 128;
+const PROXY_FILTER_NODE_THRESHOLD: usize = 256;
+const PROXY_FILTER_CHUNK_SIZE: u64 = 256;
+const PROXY_POWER_ITERATIONS: usize = 24;
+const PROXY_RESTARTS: usize = 2;
+const PROXY_FILTER_TOLERANCE: f64 = 1.0e-4;
 const SPECTRAL_EPSILON: f64 = 1.0e-9;
 
 #[derive(Debug, Clone)]
@@ -80,7 +87,27 @@ pub enum GraphValidationError {
 /// validation rules is selected.
 pub fn generate_cubic_ramanujan_graph_100() -> Result<VerifiedRamanujanGraph, GraphGenerationError>
 {
-    generate_verified_regular_graph(NODE_COUNT, REGULAR_DEGREE, DEFAULT_SEED_SEARCH_LIMIT)
+    generate_cubic_ramanujan_graph(NODE_COUNT)
+}
+
+/// Generate a verified `d = 3` Ramanujan candidate for an arbitrary even node count.
+///
+/// The default seed search budget scales with graph size so MNIST-scale graphs have a
+/// larger deterministic search window than the original 100-node MVP.
+pub fn generate_cubic_ramanujan_graph(
+    node_count: usize,
+) -> Result<VerifiedRamanujanGraph, GraphGenerationError> {
+    generate_verified_regular_graph(
+        node_count,
+        REGULAR_DEGREE,
+        recommended_seed_search_limit(node_count),
+    )
+}
+
+pub fn recommended_seed_search_limit(node_count: usize) -> u64 {
+    (node_count as u64)
+        .saturating_mul(DEFAULT_SEED_SEARCH_MULTIPLIER)
+        .max(MINIMUM_SEED_SEARCH_LIMIT)
 }
 
 /// Generate a verified `d = 3` regular graph and attach the spectral certificate
@@ -96,6 +123,10 @@ pub fn generate_verified_regular_graph(
 
     if degree != REGULAR_DEGREE {
         return Err(GraphGenerationError::UnsupportedDegree { degree });
+    }
+
+    if node_count >= PROXY_FILTER_NODE_THRESHOLD {
+        return generate_verified_regular_graph_with_proxy_filter(node_count, degree, search_limit);
     }
 
     (0..search_limit)
@@ -129,7 +160,15 @@ pub fn validate_graph(
 ) -> Result<SpectralCertificate, GraphValidationError> {
     let adjacency_lists = build_adjacency_lists(node_count, degree, edges)?;
     ensure_connected(&adjacency_lists)?;
+    spectral_certificate_from_edges(node_count, degree, edges, search_seed)
+}
 
+fn spectral_certificate_from_edges(
+    node_count: usize,
+    degree: usize,
+    edges: &[(usize, usize)],
+    search_seed: u64,
+) -> Result<SpectralCertificate, GraphValidationError> {
     let spectrum = SymmetricEigen::new(adjacency_matrix(node_count, edges));
     let mut absolute_eigenvalues: Vec<f64> = spectrum
         .eigenvalues
@@ -153,6 +192,55 @@ pub fn validate_graph(
     })
 }
 
+fn generate_verified_regular_graph_with_proxy_filter(
+    node_count: usize,
+    degree: usize,
+    search_limit: u64,
+) -> Result<VerifiedRamanujanGraph, GraphGenerationError> {
+    let ramanujan_bound = 2.0 * ((degree - 1) as f64).sqrt();
+    let mut chunk_start = 0u64;
+
+    while chunk_start < search_limit {
+        let chunk_end = (chunk_start + PROXY_FILTER_CHUNK_SIZE).min(search_limit);
+        let mut promising_candidates: Vec<ProxySearchCandidate> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .filter_map(|seed| {
+                generate_candidate_for_proxy_filter(node_count, degree, seed, ramanujan_bound)
+            })
+            .collect();
+
+        promising_candidates.sort_unstable_by_key(|candidate| candidate.seed);
+
+        for candidate in promising_candidates {
+            if let Ok(certificate) = spectral_certificate_from_edges(
+                node_count,
+                degree,
+                &candidate.edges,
+                candidate.seed,
+            ) {
+                if certificate.is_ramanujan() {
+                    return Ok(VerifiedRamanujanGraph {
+                        edges: candidate.edges,
+                        certificate,
+                    });
+                }
+            }
+        }
+
+        chunk_start = chunk_end;
+    }
+
+    Err(GraphGenerationError::SearchExhausted {
+        attempts: search_limit,
+    })
+}
+
+#[derive(Debug)]
+struct ProxySearchCandidate {
+    seed: u64,
+    edges: Vec<Edge>,
+}
+
 fn generate_candidate_from_seed(
     node_count: usize,
     degree: usize,
@@ -162,6 +250,30 @@ fn generate_candidate_from_seed(
     let certificate = validate_graph(node_count, degree, &edges, seed).ok()?;
 
     Some(VerifiedRamanujanGraph { edges, certificate })
+}
+
+fn generate_candidate_for_proxy_filter(
+    node_count: usize,
+    degree: usize,
+    seed: u64,
+    ramanujan_bound: f64,
+) -> Option<ProxySearchCandidate> {
+    let edges = generate_edge_disjoint_matchings(node_count, degree, seed)?;
+    let adjacency_lists = build_adjacency_lists(node_count, degree, &edges).ok()?;
+    ensure_connected(&adjacency_lists).ok()?;
+
+    // Every regular bipartite graph has an eigenvalue at `-degree`, so it cannot satisfy
+    // the cubic Ramanujan bound on the second-largest absolute eigenvalue.
+    if is_bipartite(&adjacency_lists) {
+        return None;
+    }
+
+    let spectral_proxy = approximate_nontrivial_spectral_radius(&adjacency_lists, seed);
+    if spectral_proxy > ramanujan_bound + PROXY_FILTER_TOLERANCE {
+        return None;
+    }
+
+    Some(ProxySearchCandidate { seed, edges })
 }
 
 /// Candidate construction strategy:
@@ -272,6 +384,101 @@ fn ensure_connected(adjacency_lists: &[Vec<usize>]) -> Result<(), GraphValidatio
     }
 }
 
+fn is_bipartite(adjacency_lists: &[Vec<usize>]) -> bool {
+    let mut colors = vec![None; adjacency_lists.len()];
+
+    for start in 0..adjacency_lists.len() {
+        if colors[start].is_some() {
+            continue;
+        }
+
+        colors[start] = Some(false);
+        let mut frontier = VecDeque::from([start]);
+
+        while let Some(node) = frontier.pop_front() {
+            let node_color = colors[node].expect("frontier nodes are always colored");
+            for &neighbor in &adjacency_lists[node] {
+                match colors[neighbor] {
+                    Some(existing) if existing == node_color => return false,
+                    Some(_) => {}
+                    None => {
+                        colors[neighbor] = Some(!node_color);
+                        frontier.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn approximate_nontrivial_spectral_radius(adjacency_lists: &[Vec<usize>], seed: u64) -> f64 {
+    let node_count = adjacency_lists.len();
+    if node_count == 0 {
+        return 0.0;
+    }
+
+    let mut best_estimate = 0.0f64;
+    for restart in 0..PROXY_RESTARTS {
+        let restart_seed = seed ^ (restart as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut rng = ChaCha8Rng::seed_from_u64(restart_seed);
+        let mut state: Vec<f64> = (0..node_count).map(|_| rng.gen_range(-1.0..=1.0)).collect();
+        orthogonalize_to_constant_vector(&mut state);
+
+        let norm = l2_norm(&state);
+        if norm <= SPECTRAL_EPSILON {
+            continue;
+        }
+        for value in &mut state {
+            *value /= norm;
+        }
+
+        for _ in 0..PROXY_POWER_ITERATIONS {
+            let next = apply_adjacency(adjacency_lists, &state);
+            let mut next = apply_adjacency(adjacency_lists, &next);
+            orthogonalize_to_constant_vector(&mut next);
+
+            let norm = l2_norm(&next);
+            if norm <= SPECTRAL_EPSILON {
+                break;
+            }
+
+            for (slot, value) in next.into_iter().enumerate() {
+                state[slot] = value / norm;
+            }
+        }
+
+        let adjacency_times_state = apply_adjacency(adjacency_lists, &state);
+        let rayleigh = dot(&state, &adjacency_times_state).abs();
+        best_estimate = best_estimate.max(rayleigh);
+    }
+
+    best_estimate
+}
+
+fn apply_adjacency(adjacency_lists: &[Vec<usize>], input: &[f64]) -> Vec<f64> {
+    adjacency_lists
+        .iter()
+        .map(|neighbors| neighbors.iter().map(|&neighbor| input[neighbor]).sum())
+        .collect()
+}
+
+fn orthogonalize_to_constant_vector(vector: &mut [f64]) {
+    let mean = vector.iter().sum::<f64>() / vector.len() as f64;
+    for value in vector {
+        *value -= mean;
+    }
+}
+
+fn l2_norm(vector: &[f64]) -> f64 {
+    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
+}
+
+fn dot(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
 fn normalized_edge(left: usize, right: usize) -> Edge {
     if left <= right {
         (left, right)
@@ -293,5 +500,21 @@ mod tests {
         assert!(
             (graph.certificate.largest_absolute_eigenvalue - REGULAR_DEGREE as f64).abs() < 1.0e-6
         );
+    }
+
+    #[test]
+    fn scales_default_search_limit_with_graph_size() {
+        assert_eq!(recommended_seed_search_limit(100), 50_000);
+        assert_eq!(recommended_seed_search_limit(784), 100_352);
+    }
+
+    #[test]
+    #[ignore = "expensive topology search for MNIST-scale graphs"]
+    fn finds_a_verified_cubic_graph_for_mnist_scale() {
+        let graph = generate_cubic_ramanujan_graph(784).expect("expected a verified graph");
+
+        assert_eq!(graph.edges.len(), 784 * REGULAR_DEGREE / 2);
+        assert_eq!(graph.certificate.node_count, 784);
+        assert!(graph.certificate.is_ramanujan());
     }
 }
