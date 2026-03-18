@@ -73,7 +73,31 @@ src/
 cargo test
 ```
 
-The crate is currently a library, not a CLI application, so `cargo test` is the main validation path.
+The crate now ships with a training binary as well as the library API. `cargo test` remains the main correctness check for the reusable components.
+
+### Run The Training Loop
+
+```bash
+cargo run -- \
+  --train-images data/train-images-idx3-ubyte \
+  --train-labels data/train-labels-idx1-ubyte \
+  --epochs 1 \
+  --learning-rate 0.001 \
+  --activation tanh
+```
+
+Useful options:
+
+- `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph.
+- `--weight-seed` and `--weight-init-scale` control the initial local weights attached to each node.
+
+The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags every current node as an `InputNode`, and runs the per-tick schedule:
+
+1. `inject_data_system`
+2. `update_nodes_forward_forward`
+3. `update_local_weights_forward_forward`
+
+One epoch is defined as `2 * dataset_len` ticks so that the positive and negative cursors each traverse the dataset once.
 
 ## Using the MNIST Loader
 
