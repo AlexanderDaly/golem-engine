@@ -21,6 +21,9 @@ impl NodeState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputNode;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalWeights {
     /// Weight slot `i` multiplies the activation coming from `TopologyPointers::neighbors[i]`.

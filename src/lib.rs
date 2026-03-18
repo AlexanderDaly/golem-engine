@@ -9,6 +9,7 @@
 //! - no global tensor passes or backpropagation machinery.
 
 pub mod core_math;
+pub mod data;
 pub mod ecs_runtime;
 
 pub const NODE_COUNT: usize = 100;
