@@ -34,6 +34,13 @@ impl SimulationPhase {
             Self::Negative => Self::Positive,
         }
     }
+
+    pub fn learning_direction(self) -> f32 {
+        match self {
+            Self::Positive => 1.0,
+            Self::Negative => -1.0,
+        }
+    }
 }
 
 #[derive(Debug)]

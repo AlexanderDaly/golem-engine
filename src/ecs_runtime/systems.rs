@@ -11,6 +11,8 @@ use hecs::{Entity, World};
 use thiserror::Error;
 
 use crate::ecs_runtime::components::{LocalWeights, NodeState, TopologyPointers};
+use crate::ecs_runtime::ingestion_system::SimulationPhase;
+use crate::REGULAR_DEGREE;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ActivationKind {
@@ -51,44 +53,20 @@ pub fn update_nodes_forward_forward(
     world: &mut World,
     activation_kind: ActivationKind,
 ) -> Result<(), NodeUpdateError> {
-    let update_order: Vec<Entity> = world
-        .query::<&TopologyPointers>()
-        .iter()
-        .map(|(entity, _)| entity)
-        .collect();
+    let update_order = collect_update_order(world);
 
     for entity in update_order {
-        let neighbors = {
-            let topology = world
-                .get::<&TopologyPointers>(entity)
-                .map_err(|_| NodeUpdateError::MissingTopology { node: entity })?;
-            topology.neighbors
-        };
-
-        let neighbor_weights = {
-            let weights = world
-                .get::<&LocalWeights>(entity)
-                .map_err(|_| NodeUpdateError::MissingWeights { node: entity })?;
-            weights.neighbor_weights
-        };
-
-        let mut local_input_sum = 0.0f32;
+        let neighbors = node_neighbors(world, entity)?;
+        let neighbor_weights = node_weights(world, entity)?;
+        let neighbor_activations = neighbor_activations(world, entity, &neighbors)?;
 
         // The node never inspects any global tensor. It only accumulates from the three
         // entities named in its own topology component.
-        for (slot, neighbor) in neighbors.iter().enumerate() {
-            let neighbor_activation = {
-                let neighbor_state = world.get::<&NodeState>(*neighbor).map_err(|_| {
-                    NodeUpdateError::MissingNeighbor {
-                        node: entity,
-                        neighbor: *neighbor,
-                    }
-                })?;
-                neighbor_state.activation
-            };
-
-            local_input_sum += neighbor_activation * neighbor_weights[slot];
-        }
+        let local_input_sum: f32 = neighbor_weights
+            .iter()
+            .zip(neighbor_activations.iter())
+            .map(|(weight, activation)| weight * activation)
+            .sum();
 
         let new_activation = activation_kind.apply(local_input_sum);
 
@@ -101,4 +79,164 @@ pub fn update_nodes_forward_forward(
     }
 
     Ok(())
+}
+
+/// Apply one local Forward-Forward learning sweep after a forward pass has completed.
+///
+/// Each node computes a goodness score from the activations visible in its local
+/// neighborhood:
+///
+/// `goodness = self_activation^2 + Σ(neighbor_activation^2)`
+///
+/// It then updates only its own incoming edge weights using the same local signals:
+///
+/// `Δw_i = phase_direction * learning_rate * goodness * self_activation * neighbor_activation_i`
+///
+/// Positive phases therefore reinforce locally correlated activations, while negative
+/// phases suppress them. Pass the phase associated with the sample that just completed
+/// the forward sweep. If this runs immediately after `inject_data_system`, that means
+/// using the pre-toggle phase value, or equivalently `phase.toggled()` on the
+/// post-ingestion scheduler state.
+pub fn update_local_weights_forward_forward(
+    world: &mut World,
+    phase: SimulationPhase,
+    learning_rate: f32,
+) -> Result<(), NodeUpdateError> {
+    let update_order = collect_update_order(world);
+    let phase_direction = phase.learning_direction();
+
+    for entity in update_order {
+        let neighbors = node_neighbors(world, entity)?;
+        let local_activation = node_activation(world, entity)?;
+        let neighbor_activations = neighbor_activations(world, entity, &neighbors)?;
+        let goodness = local_goodness(local_activation, &neighbor_activations);
+
+        let mut weights = world
+            .get::<&mut LocalWeights>(entity)
+            .map_err(|_| NodeUpdateError::MissingWeights { node: entity })?;
+
+        for (slot, neighbor_activation) in neighbor_activations.iter().copied().enumerate() {
+            let local_correlation = local_activation * neighbor_activation;
+            let delta = phase_direction * learning_rate * goodness * local_correlation;
+            weights.neighbor_weights[slot] += delta;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_update_order(world: &World) -> Vec<Entity> {
+    world
+        .query::<&TopologyPointers>()
+        .iter()
+        .map(|(entity, _)| entity)
+        .collect()
+}
+
+fn node_neighbors(
+    world: &World,
+    entity: Entity,
+) -> Result<[Entity; REGULAR_DEGREE], NodeUpdateError> {
+    let topology = world
+        .get::<&TopologyPointers>(entity)
+        .map_err(|_| NodeUpdateError::MissingTopology { node: entity })?;
+    Ok(topology.neighbors)
+}
+
+fn node_weights(world: &World, entity: Entity) -> Result<[f32; REGULAR_DEGREE], NodeUpdateError> {
+    let weights = world
+        .get::<&LocalWeights>(entity)
+        .map_err(|_| NodeUpdateError::MissingWeights { node: entity })?;
+    Ok(weights.neighbor_weights)
+}
+
+fn node_activation(world: &World, entity: Entity) -> Result<f32, NodeUpdateError> {
+    let state = world
+        .get::<&NodeState>(entity)
+        .map_err(|_| NodeUpdateError::MissingState { node: entity })?;
+    Ok(state.activation)
+}
+
+fn neighbor_activations(
+    world: &World,
+    entity: Entity,
+    neighbors: &[Entity; REGULAR_DEGREE],
+) -> Result<[f32; REGULAR_DEGREE], NodeUpdateError> {
+    let mut activations = [0.0; REGULAR_DEGREE];
+
+    for (slot, neighbor) in neighbors.iter().copied().enumerate() {
+        activations[slot] = world
+            .get::<&NodeState>(neighbor)
+            .map_err(|_| NodeUpdateError::MissingNeighbor {
+                node: entity,
+                neighbor,
+            })?
+            .activation;
+    }
+
+    Ok(activations)
+}
+
+fn local_goodness(local_activation: f32, neighbor_activations: &[f32; REGULAR_DEGREE]) -> f32 {
+    local_activation * local_activation
+        + neighbor_activations
+            .iter()
+            .map(|activation| activation * activation)
+            .sum::<f32>()
+}
+
+#[cfg(test)]
+mod tests {
+    use hecs::World;
+
+    use super::*;
+    use crate::ecs_runtime::components::{LocalWeights, NodeState, TopologyPointers};
+
+    const EPSILON: f32 = 1.0e-6;
+
+    #[test]
+    fn update_local_weights_forward_forward_reinforces_goodness_during_positive_phase() {
+        let (mut world, node) = single_learning_node_world();
+
+        update_local_weights_forward_forward(&mut world, SimulationPhase::Positive, 0.1)
+            .expect("positive learning update");
+
+        let weights = world
+            .get::<&LocalWeights>(node)
+            .expect("weights after positive update");
+
+        assert!((weights.neighbor_weights[0] - 0.6562).abs() < EPSILON);
+        assert!((weights.neighbor_weights[1] + 0.3281).abs() < EPSILON);
+        assert!((weights.neighbor_weights[2] - 0.13905).abs() < EPSILON);
+    }
+
+    #[test]
+    fn update_local_weights_forward_forward_suppresses_goodness_during_negative_phase() {
+        let (mut world, node) = single_learning_node_world();
+
+        update_local_weights_forward_forward(&mut world, SimulationPhase::Negative, 0.1)
+            .expect("negative learning update");
+
+        let weights = world
+            .get::<&LocalWeights>(node)
+            .expect("weights after negative update");
+
+        assert!((weights.neighbor_weights[0] - 0.3438).abs() < EPSILON);
+        assert!((weights.neighbor_weights[1] + 0.1719).abs() < EPSILON);
+        assert!((weights.neighbor_weights[2] - 0.06095).abs() < EPSILON);
+    }
+
+    fn single_learning_node_world() -> (World, Entity) {
+        let mut world = World::new();
+        let neighbor_a = world.spawn((NodeState::new(1.0),));
+        let neighbor_b = world.spawn((NodeState::new(-0.5),));
+        let neighbor_c = world.spawn((NodeState::new(0.25),));
+        let node = world.spawn((
+            NodeState::new(0.8),
+            LocalWeights::new([0.5, -0.25, 0.1]),
+            TopologyPointers::new([neighbor_a, neighbor_b, neighbor_c]),
+        ));
+
+        (world, node)
+    }
 }

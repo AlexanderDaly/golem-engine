@@ -30,6 +30,7 @@ The ECS layer uses `hecs` and models each graph node as its own entity.
 - [`LocalWeights`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/components.rs#L27) stores the three edge-local weights.
 - [`TopologyPointers`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/components.rs#L45) stores exactly three neighbor entity IDs.
 - [`update_nodes_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs#L47) performs an in-place asynchronous sweep, so later entities in the tick may observe earlier updates.
+- [`update_local_weights_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs) applies a local Forward-Forward learning step by scoring neighborhood goodness and nudging only the node’s own incoming weights.
 
 ### 3. Contrastive MNIST Pipeline
 
@@ -105,9 +106,9 @@ The intended tick order is:
 
 1. Run [`inject_data_system`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs#L143) at the start of the tick.
 2. Run [`update_nodes_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs#L47) to propagate activations through the graph.
-3. Apply whatever local Forward-Forward goodness scoring or weight update rule sits on top of the node activations.
+3. Run [`update_local_weights_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs) with the phase corresponding to the sample that just propagated. Because [`inject_data_system`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs#L143) advances the phase immediately, that is the pre-toggle phase, or `phase.toggled()` if you are reusing the post-ingestion phase variable.
 
-The repo currently includes the graph primitive, the data path, and the asynchronous ECS propagation layer. The actual local learning rule still needs to be layered on top.
+The repo now includes the graph primitive, the data path, the asynchronous ECS propagation layer, and a local Forward-Forward weight update step built directly on node-local goodness.
 
 ## Status
 
@@ -117,12 +118,12 @@ Implemented:
 - ECS node model for graph-local asynchronous updates,
 - MNIST positive stream with native IDX parsing,
 - plausible negative generation via digit hybridization,
-- phase-driven ingestion into input entities.
+- phase-driven ingestion into input entities,
+- node-local Forward-Forward goodness evaluation and weight updates.
 
 Not yet implemented:
 
 - a training loop binary,
-- node-local Forward-Forward goodness evaluation,
 - checkpointing or experiment management,
 - distributed runtime across multiple physical workers.
 
