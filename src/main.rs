@@ -12,7 +12,12 @@ use golem_engine::core_math::ramanujan_gen::{
     generate_verified_regular_graph, GraphGenerationError, VerifiedRamanujanGraph,
 };
 use golem_engine::data::mnist_loader::{MnistDataset, MnistLoadError};
-use golem_engine::ecs_runtime::components::{InputNode, LocalWeights, NodeState, TopologyPointers};
+use golem_engine::ecs_runtime::checkpoint::{
+    load_checkpoint_json, save_checkpoint_json, CheckpointError,
+};
+use golem_engine::ecs_runtime::components::{
+    InputNode, LocalWeights, NodeState, StableNodeIndex, TopologyPointers,
+};
 use golem_engine::ecs_runtime::ingestion_system::{
     inject_data_system, ContrastiveDataStream, IngestionError, SimulationPhase,
 };
@@ -52,20 +57,28 @@ fn run() -> Result<(), AppError> {
     let dataset = MnistDataset::load(&config.train_images, &config.train_labels)?;
     println!("loaded {} labeled samples", dataset.len());
 
-    println!(
-        "searching deterministic seeds for a verified {}-node, {}-regular Ramanujan graph (limit: {})",
-        NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit
-    );
-    let graph =
-        generate_verified_regular_graph(NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit)?;
-    println!(
-        "using graph from seed {} with second-largest |eigenvalue| {:.6} (bound {:.6})",
-        graph.certificate.search_seed,
-        graph.certificate.second_largest_absolute_eigenvalue,
-        graph.certificate.ramanujan_bound
-    );
+    let (mut world, mut phase) = if let Some(path) = &config.load_checkpoint {
+        println!("loading checkpoint from {}", path.display());
+        load_checkpoint_json(path)?
+    } else {
+        println!(
+            "searching deterministic seeds for a verified {}-node, {}-regular Ramanujan graph (limit: {})",
+            NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit
+        );
+        let graph =
+            generate_verified_regular_graph(NODE_COUNT, REGULAR_DEGREE, config.graph_search_limit)?;
+        println!(
+            "using graph from seed {} with second-largest |eigenvalue| {:.6} (bound {:.6})",
+            graph.certificate.search_seed,
+            graph.certificate.second_largest_absolute_eigenvalue,
+            graph.certificate.ramanujan_bound
+        );
 
-    let mut world = build_training_world(&graph, config.weight_seed, config.weight_init_scale)?;
+        (
+            build_training_world(&graph, config.weight_seed, config.weight_init_scale)?,
+            SimulationPhase::Positive,
+        )
+    };
     let mut stream = ContrastiveDataStream::new(dataset)?;
     let ticks_per_epoch =
         stream
@@ -95,7 +108,6 @@ fn run() -> Result<(), AppError> {
         config.weight_init_scale
     );
 
-    let mut phase = SimulationPhase::Positive;
     for epoch in 0..config.epochs {
         for _tick in 0..ticks_per_epoch {
             let sample_phase = phase;
@@ -115,6 +127,11 @@ fn run() -> Result<(), AppError> {
         );
     }
 
+    if let Some(path) = &config.save_checkpoint {
+        save_checkpoint_json(path, &world, phase)?;
+        println!("saved checkpoint to {}", path.display());
+    }
+
     println!("training complete");
 
     Ok(())
@@ -130,6 +147,8 @@ struct TrainingConfig {
     graph_search_limit: u64,
     weight_seed: u64,
     weight_init_scale: f32,
+    load_checkpoint: Option<PathBuf>,
+    save_checkpoint: Option<PathBuf>,
 }
 
 impl TrainingConfig {
@@ -148,6 +167,8 @@ impl TrainingConfig {
         let mut graph_search_limit = DEFAULT_GRAPH_SEARCH_LIMIT;
         let mut weight_seed = DEFAULT_WEIGHT_SEED;
         let mut weight_init_scale = DEFAULT_WEIGHT_INIT_SCALE;
+        let mut load_checkpoint = None;
+        let mut save_checkpoint = None;
 
         let remaining: Vec<String> = args.collect();
         if remaining.is_empty() {
@@ -219,6 +240,12 @@ impl TrainingConfig {
                         });
                     }
                 }
+                "--load-checkpoint" => {
+                    load_checkpoint = Some(PathBuf::from(argument_value(&remaining, &mut index)?));
+                }
+                "--save-checkpoint" => {
+                    save_checkpoint = Some(PathBuf::from(argument_value(&remaining, &mut index)?));
+                }
                 flag => {
                     return Err(AppError::UnknownFlag {
                         flag: flag.to_owned(),
@@ -242,6 +269,8 @@ impl TrainingConfig {
             graph_search_limit,
             weight_seed,
             weight_init_scale,
+            load_checkpoint,
+            save_checkpoint,
         })
     }
 }
@@ -281,6 +310,8 @@ enum AppError {
     Ingestion(#[from] IngestionError),
     #[error("failed to generate a verified graph: {0}")]
     GraphGeneration(#[from] GraphGenerationError),
+    #[error("checkpoint operation failed: {0}")]
+    Checkpoint(#[from] CheckpointError),
     #[error("training step failed: {0}")]
     NodeUpdate(#[from] NodeUpdateError),
     #[error("graph edge ({u}, {v}) references an out-of-bounds node for node_count {node_count}")]
@@ -364,7 +395,13 @@ fn build_training_world(
     let adjacency = build_adjacency_lists(node_count, &graph.edges)?;
     let mut world = World::new();
     let entities: Vec<Entity> = (0..node_count)
-        .map(|_| world.spawn((InputNode, NodeState::new(0.0))))
+        .map(|node_index| {
+            world.spawn((
+                InputNode,
+                StableNodeIndex::new(node_index),
+                NodeState::new(0.0),
+            ))
+        })
         .collect();
     let mut rng = ChaCha8Rng::seed_from_u64(weight_seed);
 
@@ -466,6 +503,8 @@ Options:
   --graph-search-limit <N>   Deterministic seed search budget for Ramanujan graph generation (default: {DEFAULT_GRAPH_SEARCH_LIMIT})
   --weight-seed <N>          RNG seed for local weight initialization (default: {DEFAULT_WEIGHT_SEED})
   --weight-init-scale <F32>  Uniform half-range for initial weights (default: {DEFAULT_WEIGHT_INIT_SCALE})
+  --load-checkpoint <PATH>   Restore a previously saved graph state instead of generating a new graph
+  --save-checkpoint <PATH>   Persist the final graph state after training
   --help, -h                 Show this help text
 
 Training schedule per tick:
@@ -519,5 +558,24 @@ mod tests {
                 flag: "--train-labels"
             }
         ));
+    }
+
+    #[test]
+    fn parses_checkpoint_paths() {
+        let config = TrainingConfig::from_args([
+            "golem-engine".to_owned(),
+            "--train-images".to_owned(),
+            "train-images-idx3-ubyte".to_owned(),
+            "--train-labels".to_owned(),
+            "train-labels-idx1-ubyte".to_owned(),
+            "--load-checkpoint".to_owned(),
+            "input.json".to_owned(),
+            "--save-checkpoint".to_owned(),
+            "output.json".to_owned(),
+        ])
+        .expect("parse checkpoint config");
+
+        assert_eq!(config.load_checkpoint, Some(PathBuf::from("input.json")));
+        assert_eq!(config.save_checkpoint, Some(PathBuf::from("output.json")));
     }
 }

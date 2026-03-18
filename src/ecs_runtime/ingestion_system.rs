@@ -13,6 +13,7 @@
 //! flattened image onto the available input nodes by deterministic averaging.
 
 use hecs::{Entity, World};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::data::mnist_loader::{MnistDataset, MnistSampleError, MNIST_IMAGE_PIXELS};
@@ -21,7 +22,7 @@ use crate::data::procedural_negatives::{
 };
 use crate::ecs_runtime::components::{InputNode, NodeState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimulationPhase {
     Positive,
     Negative,

@@ -83,13 +83,16 @@ cargo run -- \
   --train-labels data/train-labels-idx1-ubyte \
   --epochs 1 \
   --learning-rate 0.001 \
-  --activation tanh
+  --activation tanh \
+  --save-checkpoint checkpoints/epoch-1.json
 ```
 
 Useful options:
 
 - `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph.
 - `--weight-seed` and `--weight-init-scale` control the initial local weights attached to each node.
+- `--save-checkpoint` writes the final graph state, including weights, activations, and stable topology indices, to JSON.
+- `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
 
 The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags every current node as an `InputNode`, and runs the per-tick schedule:
 
@@ -98,6 +101,8 @@ The binary constructs the verified sparse graph, spawns one ECS entity per graph
 3. `update_local_weights_forward_forward`
 
 One epoch is defined as `2 * dataset_len` ticks so that the positive and negative cursors each traverse the dataset once.
+
+Checkpoint files store stable node indices rather than raw `hecs::Entity` IDs, so the graph can be reconstructed exactly across process restarts.
 
 ## Using the MNIST Loader
 
@@ -143,12 +148,12 @@ Implemented:
 - MNIST positive stream with native IDX parsing,
 - plausible negative generation via digit hybridization,
 - phase-driven ingestion into input entities,
-- node-local Forward-Forward goodness evaluation and weight updates.
+- node-local Forward-Forward goodness evaluation and weight updates,
+- JSON checkpoint save/load for graph state persistence.
 
 Not yet implemented:
 
-- a training loop binary,
-- checkpointing or experiment management,
+- experiment management,
 - distributed runtime across multiple physical workers.
 
 ## License

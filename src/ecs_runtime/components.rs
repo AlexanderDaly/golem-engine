@@ -6,8 +6,9 @@
 //! local weights explicit.
 
 use hecs::Entity;
+use serde::{Deserialize, Serialize};
 
-use crate::REGULAR_DEGREE;
+use crate::{NodeIndex, REGULAR_DEGREE};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NodeState {
@@ -24,7 +25,7 @@ impl NodeState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputNode;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LocalWeights {
     /// Weight slot `i` multiplies the activation coming from `TopologyPointers::neighbors[i]`.
     pub neighbor_weights: [f32; REGULAR_DEGREE],
@@ -39,6 +40,17 @@ impl LocalWeights {
         Self {
             neighbor_weights: [value; REGULAR_DEGREE],
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StableNodeIndex {
+    pub index: NodeIndex,
+}
+
+impl StableNodeIndex {
+    pub fn new(index: NodeIndex) -> Self {
+        Self { index }
     }
 }
 
