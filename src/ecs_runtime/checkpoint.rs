@@ -177,6 +177,15 @@ pub fn save_checkpoint_json<P: AsRef<Path>>(
 ) -> Result<(), CheckpointError> {
     let checkpoint = GraphCheckpoint::from_world(world, phase)?;
     let path = path.as_ref().to_path_buf();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| CheckpointError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
     let bytes =
         serde_json::to_vec_pretty(&checkpoint).map_err(|source| CheckpointError::Serialize {
             path: path.clone(),

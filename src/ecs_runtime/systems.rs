@@ -7,14 +7,19 @@
 //! - writes happen immediately, so later entities in the same tick can observe earlier
 //!   updates and there is no hidden global synchronization barrier.
 
+use std::fmt;
+use std::str::FromStr;
+
 use hecs::{Entity, World};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ecs_runtime::components::{LocalWeights, NodeState, TopologyPointers};
 use crate::ecs_runtime::ingestion_system::SimulationPhase;
 use crate::REGULAR_DEGREE;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActivationKind {
     Tanh,
     Relu,
@@ -22,6 +27,14 @@ pub enum ActivationKind {
 }
 
 impl ActivationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tanh => "tanh",
+            Self::Relu => "relu",
+            Self::SoftSign => "softsign",
+        }
+    }
+
     pub fn apply(self, input: f32) -> f32 {
         match self {
             Self::Tanh => input.tanh(),
@@ -29,6 +42,33 @@ impl ActivationKind {
             Self::SoftSign => input / (1.0 + input.abs()),
         }
     }
+}
+
+impl fmt::Display for ActivationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ActivationKind {
+    type Err = ParseActivationKindError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "tanh" => Ok(Self::Tanh),
+            "relu" => Ok(Self::Relu),
+            "softsign" => Ok(Self::SoftSign),
+            _ => Err(ParseActivationKindError {
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("unsupported activation kind {value:?}; expected one of: tanh, relu, softsign")]
+pub struct ParseActivationKindError {
+    pub value: String,
 }
 
 #[derive(Debug, Error)]

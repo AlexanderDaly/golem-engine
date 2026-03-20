@@ -11,6 +11,7 @@
 pub mod core_math;
 pub mod data;
 pub mod ecs_runtime;
+pub mod training;
 
 /// Legacy MVP graph size used by the original fixed-topology prototype.
 pub const NODE_COUNT: usize = 100;

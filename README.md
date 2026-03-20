@@ -7,7 +7,8 @@ This repository is intentionally narrow in scope. It focuses on the inspectable 
 - deterministic generation and validation of configurable `d = 3` regular graphs,
 - ECS-native node state and local update dynamics,
 - MNIST ingestion for Forward-Forward style contrastive training,
-- procedurally generated negative samples formed by hybridizing real digits.
+- procedurally generated negative samples formed by hybridizing real digits,
+- run-directory experiment management with manifest, metrics, and checkpoints.
 
 ## Design Principles
 
@@ -81,11 +82,14 @@ The crate now ships with a training binary as well as the library API. `cargo te
 cargo run -- \
   --train-images data/train-images-idx3-ubyte \
   --train-labels data/train-labels-idx1-ubyte \
-  --epochs 1 \
+  --test-images data/t10k-images-idx3-ubyte \
+  --test-labels data/t10k-labels-idx1-ubyte \
+  --epochs 5 \
   --learning-rate 0.001 \
   --activation tanh \
   --graph-node-count 784 \
-  --save-checkpoint checkpoints/epoch-1.json
+  --eval-every 1 \
+  --checkpoint-every 1
 ```
 
 Useful options:
@@ -93,7 +97,10 @@ Useful options:
 - `--graph-node-count` controls the graph size. The binary defaults to `784`, which gives MNIST a direct one-pixel-per-node input surface.
 - `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph. If omitted, the default search budget scales with the requested node count.
 - `--weight-seed` and `--weight-init-scale` control the initial local weights attached to each node.
-- `--save-checkpoint` writes the final graph state, including weights, activations, and stable topology indices, to JSON.
+- `--run-dir` overrides the default `runs/<unix-timestamp>-<short-id>/` experiment directory.
+- `--eval-every` runs a no-learning Forward-Forward evaluation pass every `N` epochs and writes the results into `metrics.jsonl`.
+- `--checkpoint-every` saves `checkpoints/epoch-<N>.json` inside the run directory at the requested interval and on the final epoch.
+- `--save-checkpoint` writes an additional final checkpoint to a user-specified path.
 - `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
 
 The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `min(graph_node_count, 784)` nodes as `InputNode`, and runs the per-tick schedule:
@@ -104,7 +111,33 @@ The binary constructs the verified sparse graph, spawns one ECS entity per graph
 
 One epoch is defined as `2 * dataset_len` ticks so that the positive and negative cursors each traverse the dataset once.
 
+Forward-Forward evaluation uses the same sparse forward sweep without any weight updates. For each positive sample and each generated negative sample, the evaluator resets node activations, injects the sample, runs one forward sweep, and measures world goodness as the mean squared activation across all graph nodes.
+
 Checkpoint files store stable node indices rather than raw `hecs::Entity` IDs, so the graph can be reconstructed exactly across process restarts.
+
+### Run Directory Layout
+
+By default, each invocation creates a run directory like `runs/1710000000-abc123/`.
+
+```text
+runs/
+  1710000000-abc123/
+    manifest.json
+    metrics.jsonl
+    checkpoints/
+      epoch-000001.json
+      epoch-000005.json
+```
+
+- `manifest.json` records the effective training configuration, dataset paths, checkpoint settings, and any resume source.
+- `metrics.jsonl` appends one JSON record per epoch with activation, weight, and goodness-separation metrics. If an epoch skips evaluation because of `--eval-every`, the goodness fields are `null`.
+- `checkpoints/epoch-<N>.json` stores periodic or final in-run checkpoints using the existing ECS checkpoint format.
+
+Resume behavior:
+
+- If `--run-dir` is omitted and `--load-checkpoint` points to `runs/.../checkpoints/epoch-<N>.json`, the binary reuses that run directory when doing so would not overwrite newer metrics.
+- If the checkpoint is older than the latest metrics already recorded in that run, the binary creates a new run directory and records the checkpoint path in `manifest.json`.
+- If you want to keep appending to an existing run while resuming from a checkpoint saved outside the run directory, pass `--run-dir` explicitly.
 
 ## Using the MNIST Loader
 
@@ -152,11 +185,12 @@ Implemented:
 - plausible negative generation via digit hybridization,
 - phase-driven ingestion into input entities,
 - node-local Forward-Forward goodness evaluation and weight updates,
+- run-directory manifests and per-epoch metrics JSONL output,
+- periodic checkpointing plus checkpoint resume metadata,
 - JSON checkpoint save/load for graph state persistence.
 
 Not yet implemented:
 
-- experiment management,
 - distributed runtime across multiple physical workers.
 
 ## License

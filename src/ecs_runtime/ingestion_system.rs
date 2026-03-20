@@ -20,7 +20,7 @@ use crate::data::mnist_loader::{MnistDataset, MnistSampleError, MNIST_IMAGE_PIXE
 use crate::data::procedural_negatives::{
     generate_hybrid_negative_from_indices, HybridNegativeError,
 };
-use crate::ecs_runtime::components::{InputNode, NodeState};
+use crate::ecs_runtime::components::{InputNode, NodeState, StableNodeIndex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimulationPhase {
@@ -45,14 +45,14 @@ impl SimulationPhase {
 }
 
 #[derive(Debug)]
-pub struct ContrastiveDataStream {
-    dataset: MnistDataset,
+pub struct ContrastiveDataStream<'a> {
+    dataset: &'a MnistDataset,
     positive_cursor: usize,
     negative_cursor: usize,
 }
 
-impl ContrastiveDataStream {
-    pub fn new(dataset: MnistDataset) -> Result<Self, IngestionError> {
+impl<'a> ContrastiveDataStream<'a> {
+    pub fn new(dataset: &'a MnistDataset) -> Result<Self, IngestionError> {
         if dataset.is_empty() {
             return Err(IngestionError::EmptyDataset);
         }
@@ -72,57 +72,20 @@ impl ContrastiveDataStream {
         &mut self,
         output: &mut [f32; MNIST_IMAGE_PIXELS],
     ) -> Result<PositiveSampleMetadata, IngestionError> {
-        let index = self.positive_cursor % self.dataset.len();
-        let label = self.dataset.fill_normalized_image(index, output)?;
+        let metadata = fill_positive_sample(self.dataset, self.positive_cursor, output)?;
         self.positive_cursor = (self.positive_cursor + 1) % self.dataset.len();
 
-        Ok(PositiveSampleMetadata { index, label })
+        Ok(metadata)
     }
 
     pub fn fill_next_negative(
         &mut self,
         output: &mut [f32; MNIST_IMAGE_PIXELS],
     ) -> Result<NegativeSampleMetadata, IngestionError> {
-        let (upper_index, lower_index) = self.next_negative_pair()?;
-        let hybrid =
-            generate_hybrid_negative_from_indices(&self.dataset, upper_index, lower_index)?;
-
-        output.copy_from_slice(&hybrid.pixels);
+        let metadata = fill_negative_sample(self.dataset, self.negative_cursor, output)?;
         self.negative_cursor = (self.negative_cursor + 1) % self.dataset.len();
 
-        Ok(NegativeSampleMetadata {
-            upper_index: hybrid.upper_index,
-            lower_index: hybrid.lower_index,
-            upper_label: hybrid.upper_label,
-            lower_label: hybrid.lower_label,
-        })
-    }
-
-    fn next_negative_pair(&self) -> Result<(usize, usize), IngestionError> {
-        let len = self.dataset.len();
-        if len < 2 {
-            return Err(IngestionError::NotEnoughSamples { len });
-        }
-
-        let upper_index = self.negative_cursor % len;
-        let upper_label = self.dataset.label(upper_index)?;
-
-        let mut candidate = (upper_index + (len / 2).max(1)) % len;
-        if candidate == upper_index {
-            candidate = (candidate + 1) % len;
-        }
-
-        for _ in 0..len {
-            if candidate != upper_index && self.dataset.label(candidate)? != upper_label {
-                return Ok((upper_index, candidate));
-            }
-            candidate = (candidate + 1) % len;
-        }
-
-        Err(IngestionError::NoDistinctNegativePair {
-            source_index: upper_index,
-            source_label: upper_label,
-        })
+        Ok(metadata)
     }
 }
 
@@ -150,21 +113,9 @@ pub fn ingestion_system(
 
 pub fn inject_data_system(
     world: &mut World,
-    stream: &mut ContrastiveDataStream,
+    stream: &mut ContrastiveDataStream<'_>,
     phase: &mut SimulationPhase,
 ) -> Result<(), IngestionError> {
-    let mut input_entities: Vec<Entity> = world
-        .query::<&InputNode>()
-        .iter()
-        .map(|(entity, _)| entity)
-        .collect();
-
-    if input_entities.is_empty() {
-        return Err(IngestionError::NoInputNodes);
-    }
-
-    input_entities.sort_unstable_by_key(|entity| entity.id());
-
     let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
     match *phase {
         SimulationPhase::Positive => {
@@ -175,10 +126,51 @@ pub fn inject_data_system(
         }
     }
 
-    write_pixels_into_inputs(world, &input_entities, &pixels)?;
+    inject_pixels(world, &pixels)?;
     *phase = phase.toggled();
 
     Ok(())
+}
+
+pub fn fill_positive_sample(
+    dataset: &MnistDataset,
+    cursor: usize,
+    output: &mut [f32; MNIST_IMAGE_PIXELS],
+) -> Result<PositiveSampleMetadata, IngestionError> {
+    if dataset.is_empty() {
+        return Err(IngestionError::EmptyDataset);
+    }
+
+    let index = cursor % dataset.len();
+    let label = dataset.fill_normalized_image(index, output)?;
+
+    Ok(PositiveSampleMetadata { index, label })
+}
+
+pub fn fill_negative_sample(
+    dataset: &MnistDataset,
+    cursor: usize,
+    output: &mut [f32; MNIST_IMAGE_PIXELS],
+) -> Result<NegativeSampleMetadata, IngestionError> {
+    let (upper_index, lower_index) = negative_pair_for_cursor(dataset, cursor)?;
+    let hybrid = generate_hybrid_negative_from_indices(dataset, upper_index, lower_index)?;
+
+    output.copy_from_slice(&hybrid.pixels);
+
+    Ok(NegativeSampleMetadata {
+        upper_index: hybrid.upper_index,
+        lower_index: hybrid.lower_index,
+        upper_label: hybrid.upper_label,
+        lower_label: hybrid.lower_label,
+    })
+}
+
+pub fn inject_pixels(
+    world: &mut World,
+    pixels: &[f32; MNIST_IMAGE_PIXELS],
+) -> Result<(), IngestionError> {
+    let input_entities = sorted_input_entities(world)?;
+    write_pixels_into_inputs(world, &input_entities, pixels)
 }
 
 #[derive(Debug, Error)]
@@ -216,6 +208,58 @@ fn write_pixels_into_inputs(
     }
 
     Ok(())
+}
+
+fn sorted_input_entities(world: &World) -> Result<Vec<Entity>, IngestionError> {
+    let mut input_entities: Vec<Entity> = world
+        .query::<&InputNode>()
+        .iter()
+        .map(|(entity, _)| entity)
+        .collect();
+
+    if input_entities.is_empty() {
+        return Err(IngestionError::NoInputNodes);
+    }
+
+    input_entities.sort_unstable_by_key(|entity| input_sort_key(world, *entity));
+    Ok(input_entities)
+}
+
+fn input_sort_key(world: &World, entity: Entity) -> usize {
+    world
+        .get::<&StableNodeIndex>(entity)
+        .map(|stable_index| stable_index.index)
+        .unwrap_or_else(|_| entity.id() as usize)
+}
+
+fn negative_pair_for_cursor(
+    dataset: &MnistDataset,
+    cursor: usize,
+) -> Result<(usize, usize), IngestionError> {
+    let len = dataset.len();
+    if len < 2 {
+        return Err(IngestionError::NotEnoughSamples { len });
+    }
+
+    let upper_index = cursor % len;
+    let upper_label = dataset.label(upper_index)?;
+
+    let mut candidate = (upper_index + (len / 2).max(1)) % len;
+    if candidate == upper_index {
+        candidate = (candidate + 1) % len;
+    }
+
+    for _ in 0..len {
+        if candidate != upper_index && dataset.label(candidate)? != upper_label {
+            return Ok((upper_index, candidate));
+        }
+        candidate = (candidate + 1) % len;
+    }
+
+    Err(IngestionError::NoDistinctNegativePair {
+        source_index: upper_index,
+        source_label: upper_label,
+    })
 }
 
 fn projected_activation(
@@ -257,7 +301,7 @@ mod tests {
         )
         .expect("construct dataset");
 
-        let mut stream = ContrastiveDataStream::new(dataset).expect("stream");
+        let mut stream = ContrastiveDataStream::new(&dataset).expect("stream");
         let mut world = World::new();
         let first = world.spawn((InputNode, NodeState::new(-1.0)));
         let second = world.spawn((InputNode, NodeState::new(-1.0)));
