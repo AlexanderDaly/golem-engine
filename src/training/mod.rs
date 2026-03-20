@@ -19,6 +19,7 @@ use crate::ecs_runtime::ingestion_system::{
 use crate::ecs_runtime::systems::{
     update_local_weights_forward_forward, update_nodes_forward_forward, NodeUpdateError,
 };
+use crate::experiment::{ExperimentGoodnessAccumulator, ExperimentMetricError};
 use crate::REGULAR_DEGREE;
 
 pub use cli::{print_usage, TrainingConfig, TrainingConfigError};
@@ -159,15 +160,18 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
 
     for epoch_offset in 0..config.epochs {
         let epoch = experiment.starting_epoch() + epoch_offset + 1;
+        let mut experiment_goodness = ExperimentGoodnessAccumulator::new();
 
         for _tick in 0..ticks_per_epoch {
             let sample_phase = phase;
             inject_data_system(&mut world, &mut stream, &mut phase)?;
             update_nodes_forward_forward(&mut world, config.activation_kind)?;
+            experiment_goodness.observe_world(&world, sample_phase)?;
             update_local_weights_forward_forward(&mut world, sample_phase, config.learning_rate)?;
         }
 
         let summary = summarize_world(&world);
+        let experiment_goodness = experiment_goodness.finish()?;
         let evaluation = if epoch % config.eval_every == 0 {
             Some(evaluate_forward_forward(
                 &world,
@@ -182,6 +186,7 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
             epoch,
             experiment.elapsed_offset_seconds() + run_started.elapsed().as_secs_f64(),
             summary,
+            &experiment_goodness,
             evaluation.as_ref(),
         );
         experiment.append_metrics(&record)?;
@@ -195,20 +200,26 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
 
         if let Some(evaluation) = evaluation {
             println!(
-                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} mean_positive_goodness={:.6} mean_negative_goodness={:.6} goodness_separation={:.6}",
+                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} positive_mean_world_goodness={:.6} negative_mean_world_goodness={:.6} goodness_separation={:.6} eval_mean_positive_goodness={:.6} eval_mean_negative_goodness={:.6} eval_goodness_separation={:.6}",
                 summary.mean_abs_activation,
                 summary.mean_squared_activation,
                 summary.mean_abs_weight,
+                experiment_goodness.positive_mean_world_goodness,
+                experiment_goodness.negative_mean_world_goodness,
+                experiment_goodness.goodness_separation,
                 evaluation.mean_positive_goodness,
                 evaluation.mean_negative_goodness,
                 evaluation.goodness_separation,
             );
         } else {
             println!(
-                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} eval=skipped",
+                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} positive_mean_world_goodness={:.6} negative_mean_world_goodness={:.6} goodness_separation={:.6} eval=skipped",
                 summary.mean_abs_activation,
                 summary.mean_squared_activation,
                 summary.mean_abs_weight,
+                experiment_goodness.positive_mean_world_goodness,
+                experiment_goodness.negative_mean_world_goodness,
+                experiment_goodness.goodness_separation,
             );
         }
     }
@@ -245,6 +256,8 @@ pub enum TrainingRunError {
     Checkpoint(#[from] CheckpointError),
     #[error("training step failed: {0}")]
     NodeUpdate(#[from] NodeUpdateError),
+    #[error("failed to compute experiment goodness: {0}")]
+    ExperimentMetric(#[from] ExperimentMetricError),
     #[error("failed to build the training world: {0}")]
     WorldBuild(#[from] WorldBuildError),
     #[error("experiment management failed: {0}")]

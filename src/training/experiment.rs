@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ecs_runtime::systems::ActivationKind;
+use crate::experiment::ExperimentGoodness;
 
 use super::cli::TrainingConfig;
 use super::eval::EvaluationSummary;
@@ -67,8 +68,17 @@ pub struct MetricsRecord {
     pub mean_abs_activation: f32,
     pub mean_squared_activation: f32,
     pub mean_abs_weight: f32,
+    #[serde(default)]
+    pub positive_mean_world_goodness: Option<f32>,
+    #[serde(default)]
+    pub negative_mean_world_goodness: Option<f32>,
+    #[serde(default)]
+    pub world_goodness_separation: Option<f32>,
+    #[serde(default)]
     pub mean_positive_goodness: Option<f32>,
+    #[serde(default)]
     pub mean_negative_goodness: Option<f32>,
+    #[serde(default)]
     pub goodness_separation: Option<f32>,
 }
 
@@ -77,6 +87,7 @@ impl MetricsRecord {
         epoch: usize,
         elapsed_seconds: f64,
         world: WorldSummary,
+        experiment_goodness: &ExperimentGoodness,
         evaluation: Option<&EvaluationSummary>,
     ) -> Self {
         Self {
@@ -85,6 +96,9 @@ impl MetricsRecord {
             mean_abs_activation: world.mean_abs_activation,
             mean_squared_activation: world.mean_squared_activation,
             mean_abs_weight: world.mean_abs_weight,
+            positive_mean_world_goodness: Some(experiment_goodness.positive_mean_world_goodness),
+            negative_mean_world_goodness: Some(experiment_goodness.negative_mean_world_goodness),
+            world_goodness_separation: Some(experiment_goodness.goodness_separation),
             mean_positive_goodness: evaluation.map(|summary| summary.mean_positive_goodness),
             mean_negative_goodness: evaluation.map(|summary| summary.mean_negative_goodness),
             goodness_separation: evaluation.map(|summary| summary.goodness_separation),
@@ -577,6 +591,9 @@ mod tests {
             mean_abs_activation: 0.25,
             mean_squared_activation: 0.5,
             mean_abs_weight: 0.75,
+            positive_mean_world_goodness: Some(1.6),
+            negative_mean_world_goodness: Some(1.1),
+            world_goodness_separation: Some(0.5),
             mean_positive_goodness: Some(1.2),
             mean_negative_goodness: Some(0.8),
             goodness_separation: Some(0.4),

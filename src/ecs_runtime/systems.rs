@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::ecs_runtime::components::{LocalWeights, NodeState, TopologyPointers};
 use crate::ecs_runtime::ingestion_system::SimulationPhase;
+use crate::experiment::node_local_goodness;
 use crate::REGULAR_DEGREE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +150,7 @@ pub fn update_local_weights_forward_forward(
         let neighbors = node_neighbors(world, entity)?;
         let local_activation = node_activation(world, entity)?;
         let neighbor_activations = neighbor_activations(world, entity, &neighbors)?;
-        let goodness = local_goodness(local_activation, &neighbor_activations);
+        let goodness = node_local_goodness(local_activation, &neighbor_activations);
 
         let mut weights = world
             .get::<&mut LocalWeights>(entity)
@@ -215,14 +216,6 @@ fn neighbor_activations(
     }
 
     Ok(activations)
-}
-
-fn local_goodness(local_activation: f32, neighbor_activations: &[f32; REGULAR_DEGREE]) -> f32 {
-    local_activation * local_activation
-        + neighbor_activations
-            .iter()
-            .map(|activation| activation * activation)
-            .sum::<f32>()
 }
 
 #[cfg(test)]
