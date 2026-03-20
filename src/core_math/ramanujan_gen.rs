@@ -117,7 +117,7 @@ pub fn generate_verified_regular_graph(
     degree: usize,
     search_limit: u64,
 ) -> Result<VerifiedRamanujanGraph, GraphGenerationError> {
-    if node_count % 2 != 0 {
+    if !node_count.is_multiple_of(2) {
         return Err(GraphGenerationError::OddNodeCount { node_count });
     }
 

@@ -6,8 +6,7 @@ This repository is intentionally narrow in scope. It focuses on the inspectable 
 
 - deterministic generation and validation of configurable `d = 3` regular graphs,
 - ECS-native node state and local update dynamics,
-- MNIST ingestion for Forward-Forward style contrastive training,
-- procedurally generated negative samples formed by hybridizing real digits,
+- label-conditioned MNIST ingestion for Forward-Forward style contrastive training,
 - run-directory experiment management with manifest, metrics, and checkpoints.
 
 ## Design Principles
@@ -33,17 +32,18 @@ The ECS layer uses `hecs` and models each graph node as its own entity.
 - [`update_nodes_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs#L47) performs an in-place asynchronous sweep, so later entities in the tick may observe earlier updates.
 - [`update_local_weights_forward_forward`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/systems.rs) applies a local Forward-Forward learning step by scoring neighborhood goodness and nudging only the node’s own incoming weights.
 
-### 3. Contrastive MNIST Pipeline
+### 3. Label-Conditioned MNIST Pipeline
 
 The data path is split into three pieces:
 
 - [`MnistDataset`](/Users/alexanderdaly/Projects/golem-engine/src/data/mnist_loader.rs#L27) loads raw IDX files into contiguous byte buffers and exposes normalized 784-float views of images.
-- [`generate_hybrid_negative`](/Users/alexanderdaly/Projects/golem-engine/src/data/procedural_negatives.rs#L29) creates plausible negatives by stitching two distinct digits with a softened seam across the midpoint.
-- [`inject_data_system`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs#L143) runs as an ECS ingestion step, alternating between positive and negative samples by tracking [`SimulationPhase`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs#L24).
+- [`fill_positive_sample`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs) prepares real digits with the true candidate label.
+- [`fill_negative_sample`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs) reuses the same real image but swaps in a deterministic wrong label.
+- [`inject_data_system`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs) writes pixels into input slots `0..783`, writes a one-hot candidate label into slots `784..793`, and toggles [`SimulationPhase`](/Users/alexanderdaly/Projects/golem-engine/src/ecs_runtime/ingestion_system.rs#L24).
 
 ## Important Constraint
 
-MNIST images have 784 pixels, and the ingestion system switches behavior based on how many entities are tagged with `InputNode`. When fewer than 784 inputs are present, it projects contiguous spans of the flattened image by deterministic averaging. When at least 784 inputs are present, it already performs direct one-pixel-per-node injection. The training binary now defaults to a 784-node graph so MNIST runs can use the direct mapping path out of the box.
+MNIST images have 784 pixels, and label-conditioned Forward-Forward reserves 10 additional input slots for one-hot digit labels. Fresh runs therefore require at least 794 graph nodes, and the training binary now defaults to a 794-node graph so MNIST pixels and label slots are both available out of the box. Resuming old 784-input checkpoints is rejected with a compatibility error.
 
 ## Repository Layout
 
@@ -53,10 +53,10 @@ src/
     ramanujan_gen.rs        Graph generation, validation, spectral certificate
   data/
     mnist_loader.rs         Native IDX parsing and normalization
-    procedural_negatives.rs Hybrid negative generation
+    procedural_negatives.rs Legacy hybrid-negative utilities
   ecs_runtime/
     components.rs           Node ECS components and input marker
-    ingestion_system.rs     Contrastive data injection and phase toggling
+    ingestion_system.rs     Label-conditioned data injection and phase toggling
     systems.rs              Local asynchronous node updates
   lib.rs                    Crate exports and global constants
 ```
@@ -87,14 +87,14 @@ cargo run -- \
   --epochs 5 \
   --learning-rate 0.001 \
   --activation tanh \
-  --graph-node-count 784 \
+  --graph-node-count 794 \
   --eval-every 1 \
   --checkpoint-every 1
 ```
 
 Useful options:
 
-- `--graph-node-count` controls the graph size. The binary defaults to `784`, which gives MNIST a direct one-pixel-per-node input surface.
+- `--graph-node-count` controls the graph size. Fresh label-conditioned runs require at least `794`, and the binary defaults to `794` so the input surface includes `784` pixel slots plus `10` label slots.
 - `--graph-search-limit` controls how many deterministic seeds are searched when generating the verified Ramanujan graph. If omitted, the default search budget scales with the requested node count.
 - `--weight-seed` and `--weight-init-scale` control the initial local weights attached to each node.
 - `--run-dir` overrides the default `runs/<unix-timestamp>-<short-id>/` experiment directory.
@@ -103,7 +103,7 @@ Useful options:
 - `--save-checkpoint` writes an additional final checkpoint to a user-specified path.
 - `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
 
-The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `min(graph_node_count, 784)` nodes as `InputNode`, and runs the per-tick schedule:
+The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `794` nodes as `InputNode`, and runs the per-tick schedule:
 
 1. `inject_data_system`
 2. `update_nodes_forward_forward`
@@ -111,7 +111,7 @@ The binary constructs the verified sparse graph, spawns one ECS entity per graph
 
 One epoch is defined as `2 * dataset_len` ticks so that the positive and negative cursors each traverse the dataset once.
 
-Forward-Forward evaluation uses the same sparse forward sweep without any weight updates. For each positive sample and each generated negative sample, the evaluator resets node activations, injects the sample, runs one forward sweep, and measures world goodness as the mean squared activation across all graph nodes.
+Forward-Forward evaluation uses the same sparse forward sweep without any weight updates. For each sample, the evaluator resets node activations, sweeps all candidate labels `0..9`, injects the conditioned sample, runs one forward sweep, and predicts the digit from the highest world goodness. `metrics.jsonl` records accuracy together with correct-label goodness, best-wrong-label goodness, and the resulting margin.
 
 Checkpoint files store stable node indices rather than raw `hecs::Entity` IDs, so the graph can be reconstructed exactly across process restarts.
 
@@ -129,8 +129,8 @@ runs/
       epoch-000005.json
 ```
 
-- `manifest.json` records the effective training configuration, dataset paths, checkpoint settings, and any resume source.
-- `metrics.jsonl` appends one JSON record per epoch with activation, weight, and goodness-separation metrics. If an epoch skips evaluation because of `--eval-every`, the goodness fields are `null`.
+- `manifest.json` records the effective training configuration, dataset paths, checkpoint settings, conditioning mode, and any resume source.
+- `metrics.jsonl` appends one JSON record per epoch with activation, weight, training-phase goodness-separation metrics, and label-conditioned evaluation metrics. If an epoch skips evaluation because of `--eval-every`, the evaluation fields are `null`.
 - `checkpoints/epoch-<N>.json` stores periodic or final in-run checkpoints using the existing ECS checkpoint format.
 
 Resume behavior:
@@ -179,12 +179,13 @@ The repo now includes the graph primitive, the data path, the asynchronous ECS p
 Implemented:
 
 - verified cubic graph search and spectral certification,
-- configurable graph sizes up through MNIST-scale direct input mapping,
+- configurable graph sizes up through MNIST-scale conditioned input mapping,
 - ECS node model for graph-local asynchronous updates,
 - MNIST positive stream with native IDX parsing,
-- plausible negative generation via digit hybridization,
-- phase-driven ingestion into input entities,
+- deterministic wrong-label negatives on real digits,
+- phase-driven label-conditioned ingestion into input entities,
 - node-local Forward-Forward goodness evaluation and weight updates,
+- label-sweep evaluation with accuracy and goodness-margin reporting,
 - run-directory manifests and per-epoch metrics JSONL output,
 - periodic checkpointing plus checkpoint resume metadata,
 - JSON checkpoint save/load for graph state persistence.

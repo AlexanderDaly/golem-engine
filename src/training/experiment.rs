@@ -19,6 +19,14 @@ const MANIFEST_FILE: &str = "manifest.json";
 const METRICS_FILE: &str = "metrics.jsonl";
 const CHECKPOINTS_DIR: &str = "checkpoints";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditioningMode {
+    #[default]
+    LegacyUnlabeledContrastive,
+    LabelConditionedFf,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveRunSettings {
     pub graph_node_count: usize,
@@ -55,6 +63,8 @@ pub struct RunManifest {
     pub learning_rate: f32,
     pub weight_seed: u64,
     pub weight_init_scale: f32,
+    #[serde(default)]
+    pub conditioning_mode: ConditioningMode,
     pub eval_every: usize,
     pub checkpoint: CheckpointSettings,
     pub resume_source: Option<PathBuf>,
@@ -75,11 +85,13 @@ pub struct MetricsRecord {
     #[serde(default)]
     pub world_goodness_separation: Option<f32>,
     #[serde(default)]
-    pub mean_positive_goodness: Option<f32>,
+    pub accuracy: Option<f32>,
     #[serde(default)]
-    pub mean_negative_goodness: Option<f32>,
+    pub mean_correct_goodness: Option<f32>,
     #[serde(default)]
-    pub goodness_separation: Option<f32>,
+    pub mean_best_wrong_goodness: Option<f32>,
+    #[serde(default)]
+    pub mean_margin: Option<f32>,
 }
 
 impl MetricsRecord {
@@ -99,9 +111,10 @@ impl MetricsRecord {
             positive_mean_world_goodness: Some(experiment_goodness.positive_mean_world_goodness),
             negative_mean_world_goodness: Some(experiment_goodness.negative_mean_world_goodness),
             world_goodness_separation: Some(experiment_goodness.goodness_separation),
-            mean_positive_goodness: evaluation.map(|summary| summary.mean_positive_goodness),
-            mean_negative_goodness: evaluation.map(|summary| summary.mean_negative_goodness),
-            goodness_separation: evaluation.map(|summary| summary.goodness_separation),
+            accuracy: evaluation.map(|summary| summary.accuracy),
+            mean_correct_goodness: evaluation.map(|summary| summary.mean_correct_goodness),
+            mean_best_wrong_goodness: evaluation.map(|summary| summary.mean_best_wrong_goodness),
+            mean_margin: evaluation.map(|summary| summary.mean_margin),
         }
     }
 }
@@ -263,6 +276,7 @@ impl ExperimentRun {
             learning_rate: config.learning_rate,
             weight_seed,
             weight_init_scale,
+            conditioning_mode: ConditioningMode::LabelConditionedFf,
             eval_every: config.eval_every,
             checkpoint: CheckpointSettings {
                 checkpoint_every: config.checkpoint_every,
@@ -310,7 +324,7 @@ impl ExperimentRun {
         self.manifest
             .checkpoint
             .checkpoint_every
-            .map(|every| epoch % every == 0 || epoch == final_epoch)
+            .map(|every| epoch.is_multiple_of(every) || epoch == final_epoch)
             .unwrap_or(false)
     }
 
@@ -570,6 +584,8 @@ mod tests {
     use std::env;
 
     use super::*;
+    use crate::ecs_runtime::systems::ActivationKind;
+    use super::super::cli::DatasetPaths;
 
     #[test]
     fn default_run_dir_format_is_stable() {
@@ -594,9 +610,10 @@ mod tests {
             positive_mean_world_goodness: Some(1.6),
             negative_mean_world_goodness: Some(1.1),
             world_goodness_separation: Some(0.5),
-            mean_positive_goodness: Some(1.2),
-            mean_negative_goodness: Some(0.8),
-            goodness_separation: Some(0.4),
+            accuracy: Some(0.75),
+            mean_correct_goodness: Some(1.2),
+            mean_best_wrong_goodness: Some(0.8),
+            mean_margin: Some(0.4),
         };
 
         sink.append(&record).expect("append metrics");
@@ -622,6 +639,75 @@ mod tests {
             Some(PathBuf::from("runs/1710000000-abc123"))
         );
         assert_eq!(parse_checkpoint_epoch(&path), Some(5));
+    }
+
+    #[test]
+    fn prepared_run_directory_writes_conditioning_mode_and_accuracy_metrics() {
+        let dir = unique_test_dir("run-dir");
+        let config = TrainingConfig {
+            train: DatasetPaths {
+                images: PathBuf::from("train-images"),
+                labels: PathBuf::from("train-labels"),
+            },
+            test: None,
+            epochs: 1,
+            learning_rate: 1.0e-3,
+            activation_kind: ActivationKind::Relu,
+            graph_node_count: 794,
+            graph_search_limit: Some(123),
+            weight_seed: 7,
+            weight_init_scale: 0.05,
+            run_dir: Some(dir.clone()),
+            checkpoint_every: None,
+            eval_every: 1,
+            load_checkpoint: None,
+            save_checkpoint: None,
+        };
+
+        let mut run = ExperimentRun::prepare(
+            &config,
+            EffectiveRunSettings {
+                graph_node_count: 794,
+                effective_graph_search_limit: Some(123),
+            },
+        )
+        .expect("prepare experiment");
+        let record = MetricsRecord {
+            epoch: 1,
+            elapsed_seconds: 0.5,
+            mean_abs_activation: 0.25,
+            mean_squared_activation: 0.5,
+            mean_abs_weight: 0.75,
+            positive_mean_world_goodness: Some(1.6),
+            negative_mean_world_goodness: Some(1.1),
+            world_goodness_separation: Some(0.5),
+            accuracy: Some(0.75),
+            mean_correct_goodness: Some(1.2),
+            mean_best_wrong_goodness: Some(0.8),
+            mean_margin: Some(0.4),
+        };
+        run.append_metrics(&record).expect("append metrics");
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(run.manifest_path()).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest["conditioning_mode"], "label_conditioned_ff");
+
+        let metrics_line = fs::read_to_string(run.metrics_path())
+            .expect("read metrics")
+            .lines()
+            .next()
+            .expect("metrics line")
+            .to_owned();
+        let metrics: serde_json::Value =
+            serde_json::from_str(&metrics_line).expect("parse metrics line");
+        assert_eq!(metrics["accuracy"], 0.75);
+        assert_eq!(metrics["mean_correct_goodness"], 1.2);
+        assert_eq!(metrics["mean_best_wrong_goodness"], 0.8);
+        assert_eq!(metrics["mean_margin"], 0.4);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn unique_test_dir(stem: &str) -> PathBuf {

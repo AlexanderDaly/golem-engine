@@ -17,6 +17,9 @@ pub mod training;
 /// Legacy MVP graph size used by the original fixed-topology prototype.
 pub const NODE_COUNT: usize = 100;
 pub const REGULAR_DEGREE: usize = 3;
+pub const MNIST_LABEL_CLASS_COUNT: usize = 10;
+pub const CONDITIONED_INPUT_NODE_COUNT: usize =
+    data::mnist_loader::MNIST_IMAGE_PIXELS + MNIST_LABEL_CLASS_COUNT;
 
 pub type NodeIndex = usize;
 pub type Edge = (NodeIndex, NodeIndex);

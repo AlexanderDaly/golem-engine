@@ -215,7 +215,7 @@ pub fn read_checkpoint_json<P: AsRef<Path>>(path: P) -> Result<GraphCheckpoint, 
     serde_json::from_slice(&bytes).map_err(|source| CheckpointError::Deserialize { path, source })
 }
 
-fn validate_serialized_nodes(nodes: &mut Vec<GraphNodeCheckpoint>) -> Result<(), CheckpointError> {
+fn validate_serialized_nodes(nodes: &mut [GraphNodeCheckpoint]) -> Result<(), CheckpointError> {
     nodes.sort_unstable_by_key(|node| node.index);
 
     for (expected_index, node) in nodes.iter().enumerate() {

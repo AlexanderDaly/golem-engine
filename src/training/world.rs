@@ -5,11 +5,10 @@ use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
 
 use crate::core_math::ramanujan_gen::VerifiedRamanujanGraph;
-use crate::data::mnist_loader::MNIST_IMAGE_PIXELS;
 use crate::ecs_runtime::components::{
     InputNode, LocalWeights, NodeState, StableNodeIndex, TopologyPointers,
 };
-use crate::REGULAR_DEGREE;
+use crate::{CONDITIONED_INPUT_NODE_COUNT, REGULAR_DEGREE};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorldSummary {
@@ -38,6 +37,14 @@ pub enum WorldBuildError {
         #[source]
         source: NoSuchEntity,
     },
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum InputLayoutError {
+    #[error(
+        "label-conditioned Forward-Forward requires at least {required} input nodes; found {found}"
+    )]
+    InsufficientConditionedInputNodes { found: usize, required: usize },
 }
 
 pub fn build_training_world(
@@ -91,7 +98,28 @@ pub fn build_training_world(
 }
 
 pub fn training_input_node_count(graph_node_count: usize) -> usize {
-    graph_node_count.min(MNIST_IMAGE_PIXELS)
+    graph_node_count.min(CONDITIONED_INPUT_NODE_COUNT)
+}
+
+pub fn require_conditioned_graph_node_count(
+    graph_node_count: usize,
+) -> Result<(), InputLayoutError> {
+    require_conditioned_input_node_count(graph_node_count)
+}
+
+pub fn validate_conditioned_input_layout(world: &World) -> Result<(), InputLayoutError> {
+    require_conditioned_input_node_count(count_input_nodes(world))
+}
+
+fn require_conditioned_input_node_count(input_node_count: usize) -> Result<(), InputLayoutError> {
+    if input_node_count < CONDITIONED_INPUT_NODE_COUNT {
+        return Err(InputLayoutError::InsufficientConditionedInputNodes {
+            found: input_node_count,
+            required: CONDITIONED_INPUT_NODE_COUNT,
+        });
+    }
+
+    Ok(())
 }
 
 pub fn count_nodes(world: &World) -> usize {
@@ -173,17 +201,56 @@ fn build_adjacency_lists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecs_runtime::components::InputNode;
+    use crate::data::mnist_loader::MNIST_IMAGE_PIXELS;
 
     #[test]
-    fn training_input_node_count_caps_at_mnist_pixels() {
+    fn training_input_node_count_caps_at_conditioned_input_surface() {
         assert_eq!(training_input_node_count(100), 100);
         assert_eq!(
-            training_input_node_count(MNIST_IMAGE_PIXELS),
-            MNIST_IMAGE_PIXELS
+            training_input_node_count(CONDITIONED_INPUT_NODE_COUNT),
+            CONDITIONED_INPUT_NODE_COUNT
         );
         assert_eq!(
-            training_input_node_count(MNIST_IMAGE_PIXELS + 64),
-            MNIST_IMAGE_PIXELS
+            training_input_node_count(CONDITIONED_INPUT_NODE_COUNT + 64),
+            CONDITIONED_INPUT_NODE_COUNT
+        );
+    }
+
+    #[test]
+    fn conditioned_graph_node_count_rejects_subthreshold_worlds() {
+        let error = require_conditioned_graph_node_count(MNIST_IMAGE_PIXELS)
+            .expect_err("784-node fresh runs should be rejected");
+
+        assert_eq!(
+            error,
+            InputLayoutError::InsufficientConditionedInputNodes {
+                found: MNIST_IMAGE_PIXELS,
+                required: CONDITIONED_INPUT_NODE_COUNT,
+            }
+        );
+    }
+
+    #[test]
+    fn conditioned_input_layout_rejects_legacy_input_counts() {
+        let mut world = World::new();
+        for index in 0..MNIST_IMAGE_PIXELS {
+            world.spawn((
+                InputNode,
+                StableNodeIndex::new(index),
+                NodeState::new(0.0),
+            ));
+        }
+
+        let error = validate_conditioned_input_layout(&world)
+            .expect_err("legacy 784-input worlds should be rejected");
+
+        assert_eq!(
+            error,
+            InputLayoutError::InsufficientConditionedInputNodes {
+                found: MNIST_IMAGE_PIXELS,
+                required: CONDITIONED_INPUT_NODE_COUNT,
+            }
         );
     }
 }

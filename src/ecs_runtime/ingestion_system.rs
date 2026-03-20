@@ -1,4 +1,4 @@
-//! ECS-native contrastive data injection.
+//! ECS-native label-conditioned data injection.
 //!
 //! Scheduling expectations:
 //! - `inject_data_system` should run at the start of each simulation tick,
@@ -7,20 +7,23 @@
 //! - any learning rule that scores positive vs. negative activations should execute after
 //!   the forward sweep completes.
 //!
-//! The current node state is scalar, so the quality of the data path depends on how many
-//! entities are tagged as inputs. This system injects one pixel per node when there are at
-//! least 784 tagged input entities, and otherwise projects contiguous spans of the flattened
-//! image onto the available input nodes by deterministic averaging.
+//! Label-conditioned Forward-Forward uses a fixed conditioned input surface:
+//! - input slots `0..783` carry normalized MNIST pixels,
+//! - input slots `784..793` carry a one-hot candidate digit label,
+//! - any additional input-tagged entities are zeroed so the first 794 slots define the
+//!   entire conditioned sample.
 
 use hecs::{Entity, World};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::data::mnist_loader::{MnistDataset, MnistSampleError, MNIST_IMAGE_PIXELS};
-use crate::data::procedural_negatives::{
-    generate_hybrid_negative_from_indices, HybridNegativeError,
-};
 use crate::ecs_runtime::components::{InputNode, NodeState, StableNodeIndex};
+use crate::{CONDITIONED_INPUT_NODE_COUNT, MNIST_LABEL_CLASS_COUNT};
+
+const LABEL_SLOT_OFFSET: usize = MNIST_IMAGE_PIXELS;
+const LABEL_ON_ACTIVATION: f32 = 1.0;
+const LABEL_OFF_ACTIVATION: f32 = 0.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SimulationPhase {
@@ -65,13 +68,13 @@ impl<'a> ContrastiveDataStream<'a> {
     }
 
     pub fn dataset(&self) -> &MnistDataset {
-        &self.dataset
+        self.dataset
     }
 
     pub fn fill_next_positive(
         &mut self,
         output: &mut [f32; MNIST_IMAGE_PIXELS],
-    ) -> Result<PositiveSampleMetadata, IngestionError> {
+    ) -> Result<ConditionedSampleMetadata, IngestionError> {
         let metadata = fill_positive_sample(self.dataset, self.positive_cursor, output)?;
         self.positive_cursor = (self.positive_cursor + 1) % self.dataset.len();
 
@@ -81,7 +84,7 @@ impl<'a> ContrastiveDataStream<'a> {
     pub fn fill_next_negative(
         &mut self,
         output: &mut [f32; MNIST_IMAGE_PIXELS],
-    ) -> Result<NegativeSampleMetadata, IngestionError> {
+    ) -> Result<ConditionedSampleMetadata, IngestionError> {
         let metadata = fill_negative_sample(self.dataset, self.negative_cursor, output)?;
         self.negative_cursor = (self.negative_cursor + 1) % self.dataset.len();
 
@@ -90,17 +93,10 @@ impl<'a> ContrastiveDataStream<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PositiveSampleMetadata {
+pub struct ConditionedSampleMetadata {
     pub index: usize,
-    pub label: u8,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NegativeSampleMetadata {
-    pub upper_index: usize,
-    pub lower_index: usize,
-    pub upper_label: u8,
-    pub lower_label: u8,
+    pub true_label: u8,
+    pub candidate_label: u8,
 }
 
 pub fn ingestion_system(
@@ -117,16 +113,12 @@ pub fn inject_data_system(
     phase: &mut SimulationPhase,
 ) -> Result<(), IngestionError> {
     let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
-    match *phase {
-        SimulationPhase::Positive => {
-            let _ = stream.fill_next_positive(&mut pixels)?;
-        }
-        SimulationPhase::Negative => {
-            let _ = stream.fill_next_negative(&mut pixels)?;
-        }
-    }
+    let metadata = match *phase {
+        SimulationPhase::Positive => stream.fill_next_positive(&mut pixels)?,
+        SimulationPhase::Negative => stream.fill_next_negative(&mut pixels)?,
+    };
 
-    inject_pixels(world, &pixels)?;
+    inject_conditioned_sample(world, &pixels, metadata.candidate_label)?;
     *phase = phase.toggled();
 
     Ok(())
@@ -136,71 +128,83 @@ pub fn fill_positive_sample(
     dataset: &MnistDataset,
     cursor: usize,
     output: &mut [f32; MNIST_IMAGE_PIXELS],
-) -> Result<PositiveSampleMetadata, IngestionError> {
+) -> Result<ConditionedSampleMetadata, IngestionError> {
     if dataset.is_empty() {
         return Err(IngestionError::EmptyDataset);
     }
 
     let index = cursor % dataset.len();
-    let label = dataset.fill_normalized_image(index, output)?;
+    let true_label = dataset.fill_normalized_image(index, output)?;
+    ensure_valid_digit_label(index, true_label)?;
 
-    Ok(PositiveSampleMetadata { index, label })
+    Ok(ConditionedSampleMetadata {
+        index,
+        true_label,
+        candidate_label: true_label,
+    })
 }
 
 pub fn fill_negative_sample(
     dataset: &MnistDataset,
     cursor: usize,
     output: &mut [f32; MNIST_IMAGE_PIXELS],
-) -> Result<NegativeSampleMetadata, IngestionError> {
-    let (upper_index, lower_index) = negative_pair_for_cursor(dataset, cursor)?;
-    let hybrid = generate_hybrid_negative_from_indices(dataset, upper_index, lower_index)?;
+) -> Result<ConditionedSampleMetadata, IngestionError> {
+    if dataset.is_empty() {
+        return Err(IngestionError::EmptyDataset);
+    }
 
-    output.copy_from_slice(&hybrid.pixels);
+    let index = cursor % dataset.len();
+    let true_label = dataset.fill_normalized_image(index, output)?;
+    ensure_valid_digit_label(index, true_label)?;
+    let candidate_label = deterministic_wrong_label(true_label, index);
 
-    Ok(NegativeSampleMetadata {
-        upper_index: hybrid.upper_index,
-        lower_index: hybrid.lower_index,
-        upper_label: hybrid.upper_label,
-        lower_label: hybrid.lower_label,
+    Ok(ConditionedSampleMetadata {
+        index,
+        true_label,
+        candidate_label,
     })
 }
 
-pub fn inject_pixels(
+pub fn inject_conditioned_sample(
     world: &mut World,
     pixels: &[f32; MNIST_IMAGE_PIXELS],
+    candidate_label: u8,
 ) -> Result<(), IngestionError> {
+    ensure_valid_candidate_label(candidate_label)?;
     let input_entities = sorted_input_entities(world)?;
-    write_pixels_into_inputs(world, &input_entities, pixels)
+    write_conditioned_inputs(world, &input_entities, pixels, candidate_label)
 }
 
 #[derive(Debug, Error)]
 pub enum IngestionError {
     #[error("the MNIST dataset is empty")]
     EmptyDataset,
-    #[error("at least two MNIST samples are required for hybrid negative generation; found {len}")]
-    NotEnoughSamples { len: usize },
-    #[error("the world does not contain any entities tagged with InputNode")]
-    NoInputNodes,
+    #[error(
+        "label-conditioned Forward-Forward requires at least {required} InputNode entities; found {found}"
+    )]
+    InsufficientInputNodes { found: usize, required: usize },
     #[error("input entity {node:?} is missing a NodeState component")]
     MissingState { node: Entity },
+    #[error("MNIST sample {index} carries label {label}, but only 0..={max_label} are supported")]
+    InvalidDigitLabel {
+        index: usize,
+        label: u8,
+        max_label: u8,
+    },
+    #[error("candidate label {label} is out of range; expected 0..={max_label}")]
+    InvalidCandidateLabel { label: u8, max_label: u8 },
     #[error("failed to access an MNIST sample: {0}")]
     Sample(#[from] MnistSampleError),
-    #[error("failed to build a hybrid negative: {0}")]
-    Hybrid(#[from] HybridNegativeError),
-    #[error("no distinct negative pair could be found for index {source_index} with label {source_label}")]
-    NoDistinctNegativePair {
-        source_index: usize,
-        source_label: u8,
-    },
 }
 
-fn write_pixels_into_inputs(
+fn write_conditioned_inputs(
     world: &mut World,
     input_entities: &[Entity],
     pixels: &[f32; MNIST_IMAGE_PIXELS],
+    candidate_label: u8,
 ) -> Result<(), IngestionError> {
     for (slot, entity) in input_entities.iter().copied().enumerate() {
-        let activation = projected_activation(pixels, slot, input_entities.len());
+        let activation = conditioned_slot_activation(pixels, slot, candidate_label);
         let mut state = world
             .get::<&mut NodeState>(entity)
             .map_err(|_| IngestionError::MissingState { node: entity })?;
@@ -217,8 +221,11 @@ fn sorted_input_entities(world: &World) -> Result<Vec<Entity>, IngestionError> {
         .map(|(entity, _)| entity)
         .collect();
 
-    if input_entities.is_empty() {
-        return Err(IngestionError::NoInputNodes);
+    if input_entities.len() < CONDITIONED_INPUT_NODE_COUNT {
+        return Err(IngestionError::InsufficientInputNodes {
+            found: input_entities.len(),
+            required: CONDITIONED_INPUT_NODE_COUNT,
+        });
     }
 
     input_entities.sort_unstable_by_key(|entity| input_sort_key(world, *entity));
@@ -232,54 +239,53 @@ fn input_sort_key(world: &World, entity: Entity) -> usize {
         .unwrap_or_else(|_| entity.id() as usize)
 }
 
-fn negative_pair_for_cursor(
-    dataset: &MnistDataset,
-    cursor: usize,
-) -> Result<(usize, usize), IngestionError> {
-    let len = dataset.len();
-    if len < 2 {
-        return Err(IngestionError::NotEnoughSamples { len });
+fn ensure_valid_digit_label(index: usize, label: u8) -> Result<(), IngestionError> {
+    if usize::from(label) >= MNIST_LABEL_CLASS_COUNT {
+        return Err(IngestionError::InvalidDigitLabel {
+            index,
+            label,
+            max_label: (MNIST_LABEL_CLASS_COUNT - 1) as u8,
+        });
     }
 
-    let upper_index = cursor % len;
-    let upper_label = dataset.label(upper_index)?;
-
-    let mut candidate = (upper_index + (len / 2).max(1)) % len;
-    if candidate == upper_index {
-        candidate = (candidate + 1) % len;
-    }
-
-    for _ in 0..len {
-        if candidate != upper_index && dataset.label(candidate)? != upper_label {
-            return Ok((upper_index, candidate));
-        }
-        candidate = (candidate + 1) % len;
-    }
-
-    Err(IngestionError::NoDistinctNegativePair {
-        source_index: upper_index,
-        source_label: upper_label,
-    })
+    Ok(())
 }
 
-fn projected_activation(
+fn ensure_valid_candidate_label(label: u8) -> Result<(), IngestionError> {
+    if usize::from(label) >= MNIST_LABEL_CLASS_COUNT {
+        return Err(IngestionError::InvalidCandidateLabel {
+            label,
+            max_label: (MNIST_LABEL_CLASS_COUNT - 1) as u8,
+        });
+    }
+
+    Ok(())
+}
+
+fn deterministic_wrong_label(true_label: u8, index: usize) -> u8 {
+    let offset = (index % (MNIST_LABEL_CLASS_COUNT - 1)) as u8 + 1;
+    (true_label + offset) % MNIST_LABEL_CLASS_COUNT as u8
+}
+
+fn conditioned_slot_activation(
     pixels: &[f32; MNIST_IMAGE_PIXELS],
     slot: usize,
-    input_count: usize,
+    candidate_label: u8,
 ) -> f32 {
-    if input_count >= MNIST_IMAGE_PIXELS {
-        return pixels.get(slot).copied().unwrap_or(0.0);
+    if slot < LABEL_SLOT_OFFSET {
+        return pixels[slot];
     }
 
-    let start = slot * MNIST_IMAGE_PIXELS / input_count;
-    let mut end = (slot + 1) * MNIST_IMAGE_PIXELS / input_count;
-    if end <= start {
-        end = start + 1;
+    if slot < CONDITIONED_INPUT_NODE_COUNT {
+        let label_slot = slot - LABEL_SLOT_OFFSET;
+        return if label_slot == usize::from(candidate_label) {
+            LABEL_ON_ACTIVATION
+        } else {
+            LABEL_OFF_ACTIVATION
+        };
     }
 
-    let span = &pixels[start..end];
-    let sum: f32 = span.iter().copied().sum();
-    sum / span.len() as f32
+    0.0
 }
 
 #[cfg(test)]
@@ -288,14 +294,13 @@ mod tests {
 
     use super::*;
     use crate::data::mnist_loader::{normalize_mnist_byte, MnistDataset, MNIST_COLS, MNIST_ROWS};
-    use crate::ecs_runtime::components::NodeState;
+
+    const EPSILON: f32 = 1.0e-5;
 
     #[test]
-    fn inject_data_system_projects_positive_and_negative_samples_and_toggles_phase() {
-        const EPSILON: f32 = 1.0e-5;
-
+    fn inject_data_system_writes_pixel_and_label_slots_and_toggles_phase() {
         let dataset = MnistDataset::from_raw_bytes(
-            build_image_idx(&[[255u8; MNIST_IMAGE_PIXELS], [0u8; MNIST_IMAGE_PIXELS]])
+            build_image_idx(&[sample_with_hot_pixel(0, 255), sample_with_hot_pixel(3, 255)])
                 .into_boxed_slice(),
             build_label_idx(&[1, 8]).into_boxed_slice(),
         )
@@ -303,48 +308,135 @@ mod tests {
 
         let mut stream = ContrastiveDataStream::new(&dataset).expect("stream");
         let mut world = World::new();
-        let first = world.spawn((InputNode, NodeState::new(-1.0)));
-        let second = world.spawn((InputNode, NodeState::new(-1.0)));
-        let third = world.spawn((InputNode, NodeState::new(-1.0)));
-        let fourth = world.spawn((InputNode, NodeState::new(-1.0)));
+        for index in 0..(CONDITIONED_INPUT_NODE_COUNT + 2) {
+            world.spawn((
+                InputNode,
+                StableNodeIndex::new(index),
+                NodeState::new(-1.0),
+            ));
+        }
         let mut phase = SimulationPhase::Positive;
 
         inject_data_system(&mut world, &mut stream, &mut phase).expect("positive inject");
         assert_eq!(phase, SimulationPhase::Negative);
         assert!(
-            (world.get::<&NodeState>(first).expect("first").activation - normalize_mnist_byte(255))
+            (world
+                .get::<&NodeState>(entity_for_input_slot(&world, 0))
+                .expect("pixel slot 0")
+                .activation
+                - normalize_mnist_byte(255))
                 .abs()
                 < EPSILON
         );
         assert!(
-            (world.get::<&NodeState>(fourth).expect("fourth").activation
-                - normalize_mnist_byte(255))
-            .abs()
+            (world
+                .get::<&NodeState>(entity_for_input_slot(&world, 3))
+                .expect("pixel slot 3")
+                .activation
+                - normalize_mnist_byte(0))
+                .abs()
                 < EPSILON
+        );
+        assert_eq!(
+            world
+                .get::<&NodeState>(entity_for_input_slot(&world, LABEL_SLOT_OFFSET + 1))
+                .expect("true label slot")
+                .activation,
+            LABEL_ON_ACTIVATION
+        );
+        assert_eq!(
+            world
+                .get::<&NodeState>(entity_for_input_slot(&world, LABEL_SLOT_OFFSET))
+                .expect("off label slot")
+                .activation,
+            LABEL_OFF_ACTIVATION
+        );
+        assert_eq!(
+            world
+                .get::<&NodeState>(entity_for_input_slot(
+                    &world,
+                    CONDITIONED_INPUT_NODE_COUNT + 1,
+                ))
+                .expect("extra input slot")
+                .activation,
+            0.0
         );
 
         inject_data_system(&mut world, &mut stream, &mut phase).expect("negative inject");
         assert_eq!(phase, SimulationPhase::Positive);
-        assert!(
-            (world
-                .get::<&NodeState>(first)
-                .expect("first negative")
-                .activation
-                - normalize_mnist_byte(255))
-            .abs()
-                < EPSILON
+        let wrong_label = deterministic_wrong_label(1, 0);
+        assert_eq!(
+            world
+                .get::<&NodeState>(entity_for_input_slot(&world, LABEL_SLOT_OFFSET + 1))
+                .expect("true label off during negative phase")
+                .activation,
+            LABEL_OFF_ACTIVATION
         );
-        assert!(
-            (world
-                .get::<&NodeState>(fourth)
-                .expect("fourth negative")
-                .activation
-                - normalize_mnist_byte(0))
-            .abs()
-                < EPSILON
+        assert_eq!(
+            world
+                .get::<&NodeState>(entity_for_input_slot(
+                    &world,
+                    LABEL_SLOT_OFFSET + usize::from(wrong_label),
+                ))
+                .expect("wrong label slot")
+                .activation,
+            LABEL_ON_ACTIVATION
         );
+    }
 
-        let _ = (second, third);
+    #[test]
+    fn negative_samples_are_deterministic_and_never_match_the_true_label() {
+        let dataset = MnistDataset::from_raw_bytes(
+            build_image_idx(&[sample_with_hot_pixel(0, 255), sample_with_hot_pixel(3, 255)])
+                .into_boxed_slice(),
+            build_label_idx(&[1, 8]).into_boxed_slice(),
+        )
+        .expect("construct dataset");
+        let mut first_pixels = [0.0f32; MNIST_IMAGE_PIXELS];
+        let mut second_pixels = [0.0f32; MNIST_IMAGE_PIXELS];
+
+        let first = fill_negative_sample(&dataset, 0, &mut first_pixels).expect("first negative");
+        let second =
+            fill_negative_sample(&dataset, 0, &mut second_pixels).expect("second negative");
+
+        assert_eq!(first, second);
+        assert_eq!(first_pixels, second_pixels);
+        assert_ne!(first.true_label, first.candidate_label);
+        assert_eq!(first.index, 0);
+    }
+
+    #[test]
+    fn positive_and_negative_sampling_share_the_real_image_but_not_the_candidate_label() {
+        let dataset = MnistDataset::from_raw_bytes(
+            build_image_idx(&[sample_with_hot_pixel(0, 255), sample_with_hot_pixel(3, 255)])
+                .into_boxed_slice(),
+            build_label_idx(&[1, 8]).into_boxed_slice(),
+        )
+        .expect("construct dataset");
+        let mut positive_pixels = [0.0f32; MNIST_IMAGE_PIXELS];
+        let mut negative_pixels = [0.0f32; MNIST_IMAGE_PIXELS];
+
+        let positive = fill_positive_sample(&dataset, 0, &mut positive_pixels).expect("positive");
+        let negative = fill_negative_sample(&dataset, 0, &mut negative_pixels).expect("negative");
+
+        assert_eq!(positive.index, negative.index);
+        assert_eq!(positive.true_label, negative.true_label);
+        assert_eq!(positive_pixels, negative_pixels);
+        assert_ne!(positive.candidate_label, negative.candidate_label);
+    }
+
+    fn entity_for_input_slot(world: &World, slot: usize) -> Entity {
+        world
+            .query::<&StableNodeIndex>()
+            .iter()
+            .find_map(|(entity, stable_index)| (stable_index.index == slot).then_some(entity))
+            .expect("slot entity should exist")
+    }
+
+    fn sample_with_hot_pixel(pixel_index: usize, value: u8) -> [u8; MNIST_IMAGE_PIXELS] {
+        let mut pixels = [0u8; MNIST_IMAGE_PIXELS];
+        pixels[pixel_index] = value;
+        pixels
     }
 
     fn build_image_idx(images: &[[u8; MNIST_IMAGE_PIXELS]]) -> Vec<u8> {

@@ -14,15 +14,17 @@ use crate::data::mnist_loader::{MnistDataset, MNIST_IMAGE_PIXELS};
 use crate::ecs_runtime::checkpoint::GraphCheckpoint;
 use crate::ecs_runtime::components::NodeState;
 use crate::ecs_runtime::ingestion_system::{
-    inject_pixels, ContrastiveDataStream, IngestionError, SimulationPhase,
+    fill_positive_sample, inject_conditioned_sample, IngestionError, SimulationPhase,
 };
 use crate::ecs_runtime::systems::{update_nodes_forward_forward, ActivationKind, NodeUpdateError};
+use crate::MNIST_LABEL_CLASS_COUNT;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EvaluationSummary {
-    pub mean_positive_goodness: f32,
-    pub mean_negative_goodness: f32,
-    pub goodness_separation: f32,
+    pub accuracy: f32,
+    pub mean_correct_goodness: f32,
+    pub mean_best_wrong_goodness: f32,
+    pub mean_margin: f32,
 }
 
 #[derive(Debug, Error)]
@@ -42,28 +44,30 @@ pub fn evaluate_forward_forward(
     activation_kind: ActivationKind,
 ) -> Result<EvaluationSummary, EvaluationError> {
     let (mut eval_world, _) = GraphCheckpoint::from_world(world, phase)?.into_world()?;
-    let mut stream = ContrastiveDataStream::new(dataset)?;
-    let sample_count = stream.dataset().len();
+    let sample_count = dataset.len();
     let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
-    let mut positive_goodness_sum = 0.0f32;
-    let mut negative_goodness_sum = 0.0f32;
+    let mut correct_predictions = 0usize;
+    let mut correct_goodness_sum = 0.0f32;
+    let mut best_wrong_goodness_sum = 0.0f32;
+    let mut margin_sum = 0.0f32;
 
-    for _ in 0..sample_count {
-        let _ = stream.fill_next_positive(&mut pixels)?;
-        positive_goodness_sum += evaluate_pixels(&mut eval_world, &pixels, activation_kind)?;
+    for index in 0..sample_count {
+        let sample = fill_positive_sample(dataset, index, &mut pixels)?;
+        let evaluation =
+            evaluate_conditioned_pixels(&mut eval_world, &pixels, sample.true_label, activation_kind)?;
 
-        let _ = stream.fill_next_negative(&mut pixels)?;
-        negative_goodness_sum += evaluate_pixels(&mut eval_world, &pixels, activation_kind)?;
+        correct_predictions += usize::from(evaluation.predicted_label == sample.true_label);
+        correct_goodness_sum += evaluation.correct_goodness;
+        best_wrong_goodness_sum += evaluation.best_wrong_goodness;
+        margin_sum += evaluation.margin();
     }
 
     let sample_count = sample_count as f32;
-    let mean_positive_goodness = positive_goodness_sum / sample_count;
-    let mean_negative_goodness = negative_goodness_sum / sample_count;
-
     Ok(EvaluationSummary {
-        mean_positive_goodness,
-        mean_negative_goodness,
-        goodness_separation: mean_positive_goodness - mean_negative_goodness,
+        accuracy: correct_predictions as f32 / sample_count,
+        mean_correct_goodness: correct_goodness_sum / sample_count,
+        mean_best_wrong_goodness: best_wrong_goodness_sum / sample_count,
+        mean_margin: margin_sum / sample_count,
     })
 }
 
@@ -83,15 +87,40 @@ pub fn world_goodness(world: &World) -> f32 {
     }
 }
 
-fn evaluate_pixels(
+fn evaluate_conditioned_pixels(
     world: &mut World,
     pixels: &[f32; MNIST_IMAGE_PIXELS],
+    true_label: u8,
     activation_kind: ActivationKind,
-) -> Result<f32, EvaluationError> {
-    reset_activations(world);
-    inject_pixels(world, pixels)?;
-    update_nodes_forward_forward(world, activation_kind)?;
-    Ok(world_goodness(world))
+) -> Result<SampleEvaluation, EvaluationError> {
+    let mut predicted_label = 0u8;
+    let mut predicted_goodness = f32::NEG_INFINITY;
+    let mut correct_goodness = f32::NEG_INFINITY;
+    let mut best_wrong_goodness = f32::NEG_INFINITY;
+
+    for candidate_label in 0..MNIST_LABEL_CLASS_COUNT as u8 {
+        reset_activations(world);
+        inject_conditioned_sample(world, pixels, candidate_label)?;
+        update_nodes_forward_forward(world, activation_kind)?;
+        let goodness = world_goodness(world);
+
+        if goodness > predicted_goodness {
+            predicted_label = candidate_label;
+            predicted_goodness = goodness;
+        }
+
+        if candidate_label == true_label {
+            correct_goodness = goodness;
+        } else if goodness > best_wrong_goodness {
+            best_wrong_goodness = goodness;
+        }
+    }
+
+    Ok(SampleEvaluation {
+        predicted_label,
+        correct_goodness,
+        best_wrong_goodness,
+    })
 }
 
 fn reset_activations(world: &mut World) {
@@ -101,82 +130,123 @@ fn reset_activations(world: &mut World) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SampleEvaluation {
+    predicted_label: u8,
+    correct_goodness: f32,
+    best_wrong_goodness: f32,
+}
+
+impl SampleEvaluation {
+    fn margin(self) -> f32 {
+        self.correct_goodness - self.best_wrong_goodness
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::mnist_loader::{
-        MnistDataset, MNIST_COLS, MNIST_IMAGE_MAGIC, MNIST_IMAGE_PIXELS, MNIST_LABEL_MAGIC,
-        MNIST_ROWS,
+        normalize_mnist_byte, MnistDataset, MNIST_COLS, MNIST_IMAGE_MAGIC, MNIST_IMAGE_PIXELS,
+        MNIST_LABEL_MAGIC, MNIST_ROWS,
     };
     use crate::ecs_runtime::components::{
         InputNode, LocalWeights, NodeState, StableNodeIndex, TopologyPointers,
     };
-    use crate::ecs_runtime::ingestion_system::{fill_negative_sample, fill_positive_sample};
+    use crate::CONDITIONED_INPUT_NODE_COUNT;
+
+    const EPSILON: f32 = 1.0e-6;
 
     #[test]
-    fn evaluation_prefers_positive_goodness_on_a_synthetic_world() {
+    fn evaluation_predicts_the_true_label_on_a_synthetic_conditioned_world() {
         let dataset = MnistDataset::from_raw_bytes(
-            build_image_idx(&[[255u8; MNIST_IMAGE_PIXELS], [0u8; MNIST_IMAGE_PIXELS]])
+            build_image_idx(&[sample_with_hot_pixel(1), sample_with_hot_pixel(8)])
                 .into_boxed_slice(),
             build_label_idx(&[1u8, 8u8]).into_boxed_slice(),
         )
         .expect("dataset");
-        let (world, node) = single_node_world();
+        let world = classification_world();
 
         let summary = evaluate_forward_forward(
             &world,
             SimulationPhase::Positive,
             &dataset,
-            ActivationKind::SoftSign,
+            ActivationKind::Relu,
         )
         .expect("evaluation summary");
 
-        assert!(summary.mean_positive_goodness > summary.mean_negative_goodness);
-        assert!(summary.goodness_separation > 0.0);
-        assert_eq!(
-            world
-                .get::<&NodeState>(node)
-                .expect("node state")
-                .activation,
-            3.5
-        );
+        let active_pixel = normalize_mnist_byte(255);
+        let correct_goodness = (
+            active_pixel * active_pixel
+                + 1.0
+                + (active_pixel + 1.0) * (active_pixel + 1.0)
+        ) / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
+        let best_wrong_goodness = (
+            active_pixel * active_pixel
+                + 1.0
+                + active_pixel * active_pixel
+                + 1.0
+        ) / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
+
+        assert!((summary.accuracy - 1.0).abs() < EPSILON);
+        assert!((summary.mean_correct_goodness - correct_goodness).abs() < EPSILON);
+        assert!((summary.mean_best_wrong_goodness - best_wrong_goodness).abs() < EPSILON);
+        assert!((summary.mean_margin - (correct_goodness - best_wrong_goodness)).abs() < EPSILON);
     }
 
     #[test]
-    fn helper_fill_functions_match_stream_ordering() {
-        let dataset = MnistDataset::from_raw_bytes(
-            build_image_idx(&[[255u8; MNIST_IMAGE_PIXELS], [0u8; MNIST_IMAGE_PIXELS]])
-                .into_boxed_slice(),
-            build_label_idx(&[1u8, 8u8]).into_boxed_slice(),
-        )
-        .expect("dataset");
-        let mut positive = [0.0f32; MNIST_IMAGE_PIXELS];
-        let mut negative = [0.0f32; MNIST_IMAGE_PIXELS];
+    fn world_goodness_averages_squared_activation() {
+        let mut world = World::new();
+        let a = world.spawn((NodeState::new(3.0),));
+        let _b = world.spawn((NodeState::new(4.0),));
 
-        let positive_metadata =
-            fill_positive_sample(&dataset, 0, &mut positive).expect("positive sample");
-        let negative_metadata =
-            fill_negative_sample(&dataset, 0, &mut negative).expect("negative sample");
-
-        assert_eq!(positive_metadata.index, 0);
-        assert_eq!(negative_metadata.upper_index, 0);
-        assert_eq!(negative_metadata.lower_index, 1);
-        assert_ne!(positive, negative);
+        assert_eq!(world_goodness(&world), 12.5);
+        assert_eq!(world.get::<&NodeState>(a).expect("node state").activation, 3.0);
     }
 
-    fn single_node_world() -> (World, hecs::Entity) {
+    fn classification_world() -> World {
         let mut world = World::new();
-        let node = world.spawn((
-            InputNode,
-            StableNodeIndex::new(0),
-            NodeState::new(3.5),
-            LocalWeights::new([0.1, 0.1, 0.1]),
-        ));
+        let input_entities: Vec<_> = (0..CONDITIONED_INPUT_NODE_COUNT)
+            .map(|index| {
+                world.spawn((
+                    InputNode,
+                    StableNodeIndex::new(index),
+                    NodeState::new(0.0),
+                    LocalWeights::new([1.0 / 3.0; 3]),
+                ))
+            })
+            .collect();
+        let classifier_entities: Vec<_> = (0..MNIST_LABEL_CLASS_COUNT)
+            .map(|label| {
+                world.spawn((
+                    StableNodeIndex::new(CONDITIONED_INPUT_NODE_COUNT + label),
+                    NodeState::new(0.0),
+                    LocalWeights::new([1.0, 1.0, 0.0]),
+                ))
+            })
+            .collect();
+
+        for entity in input_entities.iter().copied() {
+            world
+                .insert(entity, (TopologyPointers::new([entity, entity, entity]),))
+                .expect("attach input topology");
+        }
+
+        for (label, entity) in classifier_entities.iter().copied().enumerate() {
+            let pixel = input_entities[label];
+            let label_input = input_entities[MNIST_IMAGE_PIXELS + label];
+            world
+                .insert(entity, (TopologyPointers::new([pixel, label_input, entity]),))
+                .expect("attach classifier topology");
+        }
 
         world
-            .insert(node, (TopologyPointers::new([node, node, node]),))
-            .expect("topology");
-        (world, node)
+    }
+
+    fn sample_with_hot_pixel(pixel_index: usize) -> [u8; MNIST_IMAGE_PIXELS] {
+        let mut pixels = [0u8; MNIST_IMAGE_PIXELS];
+        pixels[pixel_index] = 255;
+        pixels
     }
 
     fn build_image_idx(images: &[[u8; MNIST_IMAGE_PIXELS]]) -> Vec<u8> {

@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::data::mnist_loader::MNIST_IMAGE_PIXELS;
 use crate::ecs_runtime::systems::{ActivationKind, ParseActivationKindError};
+use crate::CONDITIONED_INPUT_NODE_COUNT;
 
 pub const DEFAULT_EPOCHS: usize = 1;
 pub const DEFAULT_LEARNING_RATE: f32 = 1.0e-3;
-pub const DEFAULT_GRAPH_NODE_COUNT: usize = MNIST_IMAGE_PIXELS;
+pub const DEFAULT_GRAPH_NODE_COUNT: usize = CONDITIONED_INPUT_NODE_COUNT;
 pub const DEFAULT_WEIGHT_SEED: u64 = 0;
 pub const DEFAULT_WEIGHT_INIT_SCALE: f32 = 0.05;
 pub const DEFAULT_EVAL_EVERY: usize = 1;
@@ -308,13 +308,14 @@ Training schedule per tick:
     inject_data_system -> update_nodes_forward_forward -> update_local_weights_forward_forward
 
 Evaluation schedule:
-  reset activations -> inject sample -> update_nodes_forward_forward -> measure world goodness
+  reset activations -> inject conditioned sample -> update_nodes_forward_forward -> score all candidate labels
 
 Epoch semantics:
   one epoch runs 2 * dataset_len ticks so both the positive and negative cursors traverse the full dataset once.
 
 Input semantics:
-  the first min(graph_node_count, 784) nodes are tagged as InputNode, so 784-node graphs use direct one-pixel-per-node MNIST injection by default."
+  fresh runs reserve the first 794 nodes as conditioned inputs: slots 0..783 are MNIST pixels and slots 784..793 are one-hot label inputs.
+  label-conditioned training requires graph_node_count >= 794."
     );
 }
 

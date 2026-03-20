@@ -25,12 +25,13 @@ use crate::REGULAR_DEGREE;
 pub use cli::{print_usage, TrainingConfig, TrainingConfigError};
 pub use eval::{evaluate_forward_forward, EvaluationError, EvaluationSummary};
 pub use experiment::{
-    CheckpointArtifact, CheckpointSettings, EffectiveRunSettings, ExperimentError, ExperimentRun,
-    MetricsRecord, RunManifest,
+    CheckpointArtifact, CheckpointSettings, ConditioningMode, EffectiveRunSettings,
+    ExperimentError, ExperimentRun, MetricsRecord, RunManifest,
 };
 pub use world::{
-    build_training_world, count_input_nodes, count_nodes, summarize_world,
-    training_input_node_count, WorldBuildError, WorldSummary,
+    build_training_world, count_input_nodes, count_nodes, require_conditioned_graph_node_count,
+    summarize_world, training_input_node_count, validate_conditioned_input_layout,
+    InputLayoutError, WorldBuildError, WorldSummary,
 };
 
 #[derive(Debug, Clone)]
@@ -69,8 +70,16 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
         println!(
             "resuming from serialized world state; graph generation and weight initialization flags are ignored"
         );
-        load_checkpoint_json(path)?
+        let (world, phase) = load_checkpoint_json(path)?;
+        validate_conditioned_input_layout(&world).map_err(|source| {
+            TrainingRunError::LegacyCheckpointInputLayout {
+                checkpoint: path.clone(),
+                source,
+            }
+        })?;
+        (world, phase)
     } else {
+        require_conditioned_graph_node_count(config.graph_node_count)?;
         let graph_search_limit = config
             .graph_search_limit
             .unwrap_or_else(|| recommended_seed_search_limit(config.graph_node_count));
@@ -200,16 +209,17 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
 
         if let Some(evaluation) = evaluation {
             println!(
-                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} positive_mean_world_goodness={:.6} negative_mean_world_goodness={:.6} goodness_separation={:.6} eval_mean_positive_goodness={:.6} eval_mean_negative_goodness={:.6} eval_goodness_separation={:.6}",
+                "epoch {epoch}/{final_epoch} complete | mean_abs_activation={:.6} mean_squared_activation={:.6} mean_abs_weight={:.6} positive_mean_world_goodness={:.6} negative_mean_world_goodness={:.6} goodness_separation={:.6} eval_accuracy={:.6} eval_mean_correct_goodness={:.6} eval_mean_best_wrong_goodness={:.6} eval_mean_margin={:.6}",
                 summary.mean_abs_activation,
                 summary.mean_squared_activation,
                 summary.mean_abs_weight,
                 experiment_goodness.positive_mean_world_goodness,
                 experiment_goodness.negative_mean_world_goodness,
                 experiment_goodness.goodness_separation,
-                evaluation.mean_positive_goodness,
-                evaluation.mean_negative_goodness,
-                evaluation.goodness_separation,
+                evaluation.accuracy,
+                evaluation.mean_correct_goodness,
+                evaluation.mean_best_wrong_goodness,
+                evaluation.mean_margin,
             );
         } else {
             println!(
@@ -260,6 +270,16 @@ pub enum TrainingRunError {
     ExperimentMetric(#[from] ExperimentMetricError),
     #[error("failed to build the training world: {0}")]
     WorldBuild(#[from] WorldBuildError),
+    #[error("invalid label-conditioned input layout: {0}")]
+    InputLayout(#[from] InputLayoutError),
+    #[error(
+        "checkpoint {checkpoint} is incompatible with label-conditioned Forward-Forward: {source}"
+    )]
+    LegacyCheckpointInputLayout {
+        checkpoint: PathBuf,
+        #[source]
+        source: InputLayoutError,
+    },
     #[error("experiment management failed: {0}")]
     Experiment(#[from] ExperimentError),
     #[error("forward-forward evaluation failed: {0}")]
