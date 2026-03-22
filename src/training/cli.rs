@@ -13,10 +13,21 @@ pub const DEFAULT_WEIGHT_SEED: u64 = 0;
 pub const DEFAULT_WEIGHT_INIT_SCALE: f32 = 0.05;
 pub const DEFAULT_EVAL_EVERY: usize = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DatasetPaths {
     pub images: PathBuf,
     pub labels: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerServerConfig {
+    pub listen_addr: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum CliCommand {
+    Train(TrainingConfig),
+    Worker(WorkerServerConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -35,9 +46,10 @@ pub struct TrainingConfig {
     pub eval_every: usize,
     pub load_checkpoint: Option<PathBuf>,
     pub save_checkpoint: Option<PathBuf>,
+    pub distributed_workers: Vec<String>,
 }
 
-impl TrainingConfig {
+impl CliCommand {
     pub fn from_args<I>(args: I) -> Result<Self, TrainingConfigError>
     where
         I: IntoIterator<Item = String>,
@@ -61,6 +73,8 @@ impl TrainingConfig {
         let mut eval_every = DEFAULT_EVAL_EVERY;
         let mut load_checkpoint = None;
         let mut save_checkpoint = None;
+        let mut distributed_workers = Vec::new();
+        let mut worker_listen = None;
 
         let remaining: Vec<String> = args.collect();
         if remaining.is_empty() {
@@ -187,6 +201,12 @@ impl TrainingConfig {
                 "--save-checkpoint" => {
                     save_checkpoint = Some(PathBuf::from(argument_value(&remaining, &mut index)?));
                 }
+                "--distributed-worker" => {
+                    distributed_workers.push(argument_value(&remaining, &mut index)?.to_owned());
+                }
+                "--worker-listen" => {
+                    worker_listen = Some(argument_value(&remaining, &mut index)?.to_owned());
+                }
                 flag => {
                     return Err(TrainingConfigError::UnknownFlag {
                         flag: flag.to_owned(),
@@ -195,6 +215,17 @@ impl TrainingConfig {
             }
 
             index += 1;
+        }
+
+        if let Some(listen_addr) = worker_listen {
+            if !distributed_workers.is_empty() {
+                return Err(TrainingConfigError::InvalidFlagCombination {
+                    flag: "--worker-listen",
+                    conflicting_flag: "--distributed-worker",
+                });
+            }
+
+            return Ok(Self::Worker(WorkerServerConfig { listen_addr }));
         }
 
         let train = DatasetPaths {
@@ -222,7 +253,7 @@ impl TrainingConfig {
             (None, None) => None,
         };
 
-        Ok(Self {
+        Ok(Self::Train(TrainingConfig {
             train,
             test,
             epochs,
@@ -237,7 +268,22 @@ impl TrainingConfig {
             eval_every,
             load_checkpoint,
             save_checkpoint,
-        })
+            distributed_workers,
+        }))
+    }
+}
+
+impl TrainingConfig {
+    pub fn from_args<I>(args: I) -> Result<Self, TrainingConfigError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        match CliCommand::from_args(args)? {
+            CliCommand::Train(config) => Ok(config),
+            CliCommand::Worker(config) => Err(TrainingConfigError::WorkerModeRequested {
+                listen_addr: config.listen_addr,
+            }),
+        }
     }
 }
 
@@ -256,6 +302,11 @@ pub enum TrainingConfigError {
     MissingValue { flag: String },
     #[error("unknown flag {flag}")]
     UnknownFlag { flag: String },
+    #[error("{flag} cannot be combined with {conflicting_flag}")]
+    InvalidFlagCombination {
+        flag: &'static str,
+        conflicting_flag: &'static str,
+    },
     #[error("invalid value {value:?} for {flag}: {reason}")]
     InvalidArgument {
         flag: &'static str,
@@ -268,12 +319,17 @@ pub enum TrainingConfigError {
     InvalidFloat { flag: &'static str, value: String },
     #[error("unsupported activation kind {value:?}; expected one of: tanh, relu, softsign")]
     InvalidActivation { value: String },
+    #[error(
+        "worker-server mode requested on {listen_addr}; parse with CliCommand::from_args instead"
+    )]
+    WorkerModeRequested { listen_addr: String },
 }
 
 pub fn print_usage(program: &str) {
     println!(
         "Usage:
   {program} --train-images <PATH> --train-labels <PATH> [options]
+  {program} --worker-listen <HOST:PORT>
 
 Required:
   --train-images <PATH>      Path to MNIST training image IDX data
@@ -289,6 +345,7 @@ Experiment management:
   --eval-every <N>           Run the no-learning FF evaluation every N epochs (default: {DEFAULT_EVAL_EVERY})
   --load-checkpoint <PATH>   Restore a previously saved graph state instead of generating a new graph
   --save-checkpoint <PATH>   Persist the final graph state after training
+  --distributed-worker <A>   Remote worker address (repeatable) for distributed federated averaging
 
 Training options:
   --epochs <N>               Number of epochs to run for this invocation (default: {DEFAULT_EPOCHS})
@@ -299,6 +356,10 @@ Training options:
   --weight-seed <N>          RNG seed for local weight initialization (default: {DEFAULT_WEIGHT_SEED})
   --weight-init-scale <F32>  Uniform half-range for initial weights (default: {DEFAULT_WEIGHT_INIT_SCALE})
   --help, -h                 Show this help text
+
+Worker mode:
+  --worker-listen <HOST:PORT>
+                            Run a distributed worker server instead of local training
 
 Run-directory behavior:
   if --run-dir is omitted, the binary creates runs/<unix-timestamp>-<short-id>/.
@@ -315,7 +376,11 @@ Epoch semantics:
 
 Input semantics:
   fresh runs reserve the first 794 nodes as conditioned inputs: slots 0..783 are MNIST pixels and slots 784..793 are one-hot label inputs.
-  label-conditioned training requires graph_node_count >= 794."
+  label-conditioned training requires graph_node_count >= 794.
+
+Distributed execution:
+  distributed mode snapshots the world once per epoch, sends identical checkpoints to remote workers, and averages the worker-updated worlds back on the coordinator.
+  every worker must be able to read the same dataset paths passed to --train-images/--train-labels and --test-images/--test-labels."
     );
 }
 
@@ -387,6 +452,7 @@ mod tests {
         assert_eq!(config.checkpoint_every, None);
         assert_eq!(config.eval_every, DEFAULT_EVAL_EVERY);
         assert_eq!(config.test, None);
+        assert!(config.distributed_workers.is_empty());
         assert!(matches!(config.activation_kind, ActivationKind::Tanh));
     }
 
@@ -444,5 +510,41 @@ mod tests {
                 labels: PathBuf::from("t10k-labels-idx1-ubyte"),
             })
         );
+    }
+
+    #[test]
+    fn parses_distributed_worker_addresses() {
+        let config = TrainingConfig::from_args([
+            "golem-engine".to_owned(),
+            "--train-images".to_owned(),
+            "train-images-idx3-ubyte".to_owned(),
+            "--train-labels".to_owned(),
+            "train-labels-idx1-ubyte".to_owned(),
+            "--distributed-worker".to_owned(),
+            "worker-a:7000".to_owned(),
+            "--distributed-worker".to_owned(),
+            "worker-b:7000".to_owned(),
+        ])
+        .expect("parse distributed config");
+
+        assert_eq!(
+            config.distributed_workers,
+            vec!["worker-a:7000".to_owned(), "worker-b:7000".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_worker_server_mode() {
+        let command = CliCommand::from_args([
+            "golem-engine".to_owned(),
+            "--worker-listen".to_owned(),
+            "0.0.0.0:7000".to_owned(),
+        ])
+        .expect("parse worker command");
+
+        match command {
+            CliCommand::Worker(config) => assert_eq!(config.listen_addr, "0.0.0.0:7000"),
+            CliCommand::Train(_) => panic!("expected worker mode"),
+        }
     }
 }

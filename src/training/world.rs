@@ -201,8 +201,8 @@ fn build_adjacency_lists(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs_runtime::components::InputNode;
     use crate::data::mnist_loader::MNIST_IMAGE_PIXELS;
+    use crate::ecs_runtime::components::InputNode;
 
     #[test]
     fn training_input_node_count_caps_at_conditioned_input_surface() {
@@ -235,11 +235,7 @@ mod tests {
     fn conditioned_input_layout_rejects_legacy_input_counts() {
         let mut world = World::new();
         for index in 0..MNIST_IMAGE_PIXELS {
-            world.spawn((
-                InputNode,
-                StableNodeIndex::new(index),
-                NodeState::new(0.0),
-            ));
+            world.spawn((InputNode, StableNodeIndex::new(index), NodeState::new(0.0)));
         }
 
         let error = validate_conditioned_input_layout(&world)

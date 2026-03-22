@@ -309,11 +309,7 @@ mod tests {
         let mut stream = ContrastiveDataStream::new(&dataset).expect("stream");
         let mut world = World::new();
         for index in 0..(CONDITIONED_INPUT_NODE_COUNT + 2) {
-            world.spawn((
-                InputNode,
-                StableNodeIndex::new(index),
-                NodeState::new(-1.0),
-            ));
+            world.spawn((InputNode, StableNodeIndex::new(index), NodeState::new(-1.0)));
         }
         let mut phase = SimulationPhase::Positive;
 
@@ -325,7 +321,7 @@ mod tests {
                 .expect("pixel slot 0")
                 .activation
                 - normalize_mnist_byte(255))
-                .abs()
+            .abs()
                 < EPSILON
         );
         assert!(
@@ -334,7 +330,7 @@ mod tests {
                 .expect("pixel slot 3")
                 .activation
                 - normalize_mnist_byte(0))
-                .abs()
+            .abs()
                 < EPSILON
         );
         assert_eq!(

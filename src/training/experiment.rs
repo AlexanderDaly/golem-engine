@@ -27,6 +27,12 @@ pub enum ConditioningMode {
     LabelConditionedFf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedExecutionStrategy {
+    FederatedAveraging,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EffectiveRunSettings {
     pub graph_node_count: usize,
@@ -65,6 +71,10 @@ pub struct RunManifest {
     pub weight_init_scale: f32,
     #[serde(default)]
     pub conditioning_mode: ConditioningMode,
+    #[serde(default)]
+    pub distributed_workers: Vec<String>,
+    #[serde(default)]
+    pub distributed_strategy: Option<DistributedExecutionStrategy>,
     pub eval_every: usize,
     pub checkpoint: CheckpointSettings,
     pub resume_source: Option<PathBuf>,
@@ -277,6 +287,9 @@ impl ExperimentRun {
             weight_seed,
             weight_init_scale,
             conditioning_mode: ConditioningMode::LabelConditionedFf,
+            distributed_workers: config.distributed_workers.clone(),
+            distributed_strategy: (!config.distributed_workers.is_empty())
+                .then_some(DistributedExecutionStrategy::FederatedAveraging),
             eval_every: config.eval_every,
             checkpoint: CheckpointSettings {
                 checkpoint_every: config.checkpoint_every,
@@ -583,9 +596,9 @@ fn infer_run_dir_from_checkpoint_path(path: &Path) -> Option<PathBuf> {
 mod tests {
     use std::env;
 
+    use super::super::cli::DatasetPaths;
     use super::*;
     use crate::ecs_runtime::systems::ActivationKind;
-    use super::super::cli::DatasetPaths;
 
     #[test]
     fn default_run_dir_format_is_stable() {
@@ -662,6 +675,7 @@ mod tests {
             eval_every: 1,
             load_checkpoint: None,
             save_checkpoint: None,
+            distributed_workers: Vec::new(),
         };
 
         let mut run = ExperimentRun::prepare(
@@ -688,10 +702,9 @@ mod tests {
         };
         run.append_metrics(&record).expect("append metrics");
 
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(run.manifest_path()).expect("read manifest"),
-        )
-        .expect("parse manifest");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.manifest_path()).expect("read manifest"))
+                .expect("parse manifest");
         assert_eq!(manifest["conditioning_mode"], "label_conditioned_ff");
 
         let metrics_line = fs::read_to_string(run.metrics_path())

@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod distributed;
 pub mod eval;
 pub mod experiment;
 pub mod world;
@@ -6,6 +7,7 @@ pub mod world;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use hecs::World;
 use thiserror::Error;
 
 use crate::core_math::ramanujan_gen::{
@@ -22,11 +24,12 @@ use crate::ecs_runtime::systems::{
 use crate::experiment::{ExperimentGoodnessAccumulator, ExperimentMetricError};
 use crate::REGULAR_DEGREE;
 
-pub use cli::{print_usage, TrainingConfig, TrainingConfigError};
+pub use cli::{print_usage, CliCommand, TrainingConfig, TrainingConfigError, WorkerServerConfig};
+pub use distributed::{run_worker_server, DistributedRuntimeError};
 pub use eval::{evaluate_forward_forward, EvaluationError, EvaluationSummary};
 pub use experiment::{
-    CheckpointArtifact, CheckpointSettings, ConditioningMode, EffectiveRunSettings,
-    ExperimentError, ExperimentRun, MetricsRecord, RunManifest,
+    CheckpointArtifact, CheckpointSettings, ConditioningMode, DistributedExecutionStrategy,
+    EffectiveRunSettings, ExperimentError, ExperimentRun, MetricsRecord, RunManifest,
 };
 pub use world::{
     build_training_world, count_input_nodes, count_nodes, require_conditioned_graph_node_count,
@@ -42,7 +45,29 @@ pub struct TrainingRunOutput {
     pub latest_checkpoint_path: Option<std::path::PathBuf>,
 }
 
+pub(crate) struct PreparedTrainingState {
+    pub train_dataset: MnistDataset,
+    pub test_dataset: Option<MnistDataset>,
+    pub world: World,
+    pub phase: SimulationPhase,
+    pub effective_graph_search_limit: Option<u64>,
+    pub world_node_count: usize,
+    pub input_node_count: usize,
+}
+
 pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, TrainingRunError> {
+    let prepared = prepare_training_state(&config)?;
+
+    if config.distributed_workers.is_empty() {
+        run_local_training(config, prepared)
+    } else {
+        distributed::run_distributed_training(config, prepared)
+    }
+}
+
+fn prepare_training_state(
+    config: &TrainingConfig,
+) -> Result<PreparedTrainingState, TrainingRunError> {
     println!(
         "loading MNIST training dataset from {} and {}",
         config.train.images.display(),
@@ -65,7 +90,7 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
     };
 
     let mut effective_graph_search_limit = None;
-    let (mut world, mut phase) = if let Some(path) = &config.load_checkpoint {
+    let (world, phase) = if let Some(path) = &config.load_checkpoint {
         println!("loading checkpoint from {}", path.display());
         println!(
             "resuming from serialized world state; graph generation and weight initialization flags are ignored"
@@ -118,6 +143,32 @@ pub fn run_training(config: TrainingConfig) -> Result<TrainingRunOutput, Trainin
 
     let world_node_count = count_nodes(&world);
     let input_node_count = count_input_nodes(&world);
+
+    Ok(PreparedTrainingState {
+        train_dataset,
+        test_dataset,
+        world,
+        phase,
+        effective_graph_search_limit,
+        world_node_count,
+        input_node_count,
+    })
+}
+
+fn run_local_training(
+    config: TrainingConfig,
+    prepared: PreparedTrainingState,
+) -> Result<TrainingRunOutput, TrainingRunError> {
+    let PreparedTrainingState {
+        train_dataset,
+        test_dataset,
+        mut world,
+        mut phase,
+        effective_graph_search_limit,
+        world_node_count,
+        input_node_count,
+    } = prepared;
+
     let mut experiment = ExperimentRun::prepare(
         &config,
         EffectiveRunSettings {
@@ -284,6 +335,8 @@ pub enum TrainingRunError {
     Experiment(#[from] ExperimentError),
     #[error("forward-forward evaluation failed: {0}")]
     Evaluation(#[from] EvaluationError),
+    #[error("distributed execution failed: {0}")]
+    Distributed(#[from] DistributedRuntimeError),
     #[error("training tick count overflow for dataset_len={dataset_len} epochs={epochs}")]
     TickCountOverflow { dataset_len: usize, epochs: usize },
 }

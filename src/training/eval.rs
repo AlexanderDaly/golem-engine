@@ -8,6 +8,7 @@
 //! independent of graph size and avoids counting each graph edge multiple times.
 
 use hecs::World;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::data::mnist_loader::{MnistDataset, MNIST_IMAGE_PIXELS};
@@ -27,6 +28,43 @@ pub struct EvaluationSummary {
     pub mean_margin: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub(crate) struct EvaluationAccumulator {
+    pub sample_count: usize,
+    pub correct_predictions: usize,
+    pub correct_goodness_sum: f32,
+    pub best_wrong_goodness_sum: f32,
+    pub margin_sum: f32,
+}
+
+impl EvaluationAccumulator {
+    fn record(&mut self, evaluation: SampleEvaluation, true_label: u8) {
+        self.sample_count += 1;
+        self.correct_predictions += usize::from(evaluation.predicted_label == true_label);
+        self.correct_goodness_sum += evaluation.correct_goodness;
+        self.best_wrong_goodness_sum += evaluation.best_wrong_goodness;
+        self.margin_sum += evaluation.margin();
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.sample_count += other.sample_count;
+        self.correct_predictions += other.correct_predictions;
+        self.correct_goodness_sum += other.correct_goodness_sum;
+        self.best_wrong_goodness_sum += other.best_wrong_goodness_sum;
+        self.margin_sum += other.margin_sum;
+    }
+
+    pub fn finish(self) -> EvaluationSummary {
+        let sample_count = self.sample_count as f32;
+        EvaluationSummary {
+            accuracy: self.correct_predictions as f32 / sample_count,
+            mean_correct_goodness: self.correct_goodness_sum / sample_count,
+            mean_best_wrong_goodness: self.best_wrong_goodness_sum / sample_count,
+            mean_margin: self.margin_sum / sample_count,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EvaluationError {
     #[error("checkpoint operation failed while preparing the evaluation world: {0}")]
@@ -43,32 +81,36 @@ pub fn evaluate_forward_forward(
     dataset: &MnistDataset,
     activation_kind: ActivationKind,
 ) -> Result<EvaluationSummary, EvaluationError> {
+    Ok(
+        evaluate_forward_forward_range(world, phase, dataset, activation_kind, 0..dataset.len())?
+            .finish(),
+    )
+}
+
+pub(crate) fn evaluate_forward_forward_range(
+    world: &World,
+    phase: SimulationPhase,
+    dataset: &MnistDataset,
+    activation_kind: ActivationKind,
+    range: std::ops::Range<usize>,
+) -> Result<EvaluationAccumulator, EvaluationError> {
     let (mut eval_world, _) = GraphCheckpoint::from_world(world, phase)?.into_world()?;
-    let sample_count = dataset.len();
     let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
-    let mut correct_predictions = 0usize;
-    let mut correct_goodness_sum = 0.0f32;
-    let mut best_wrong_goodness_sum = 0.0f32;
-    let mut margin_sum = 0.0f32;
+    let mut accumulator = EvaluationAccumulator::default();
 
-    for index in 0..sample_count {
+    for index in range {
         let sample = fill_positive_sample(dataset, index, &mut pixels)?;
-        let evaluation =
-            evaluate_conditioned_pixels(&mut eval_world, &pixels, sample.true_label, activation_kind)?;
+        let evaluation = evaluate_conditioned_pixels(
+            &mut eval_world,
+            &pixels,
+            sample.true_label,
+            activation_kind,
+        )?;
 
-        correct_predictions += usize::from(evaluation.predicted_label == sample.true_label);
-        correct_goodness_sum += evaluation.correct_goodness;
-        best_wrong_goodness_sum += evaluation.best_wrong_goodness;
-        margin_sum += evaluation.margin();
+        accumulator.record(evaluation, sample.true_label);
     }
 
-    let sample_count = sample_count as f32;
-    Ok(EvaluationSummary {
-        accuracy: correct_predictions as f32 / sample_count,
-        mean_correct_goodness: correct_goodness_sum / sample_count,
-        mean_best_wrong_goodness: best_wrong_goodness_sum / sample_count,
-        mean_margin: margin_sum / sample_count,
-    })
+    Ok(accumulator)
 }
 
 pub fn world_goodness(world: &World) -> f32 {
@@ -176,17 +218,12 @@ mod tests {
         .expect("evaluation summary");
 
         let active_pixel = normalize_mnist_byte(255);
-        let correct_goodness = (
-            active_pixel * active_pixel
-                + 1.0
-                + (active_pixel + 1.0) * (active_pixel + 1.0)
-        ) / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
-        let best_wrong_goodness = (
-            active_pixel * active_pixel
-                + 1.0
-                + active_pixel * active_pixel
-                + 1.0
-        ) / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
+        let correct_goodness =
+            (active_pixel * active_pixel + 1.0 + (active_pixel + 1.0) * (active_pixel + 1.0))
+                / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
+        let best_wrong_goodness =
+            (active_pixel * active_pixel + 1.0 + active_pixel * active_pixel + 1.0)
+                / (CONDITIONED_INPUT_NODE_COUNT + MNIST_LABEL_CLASS_COUNT) as f32;
 
         assert!((summary.accuracy - 1.0).abs() < EPSILON);
         assert!((summary.mean_correct_goodness - correct_goodness).abs() < EPSILON);
@@ -201,7 +238,10 @@ mod tests {
         let _b = world.spawn((NodeState::new(4.0),));
 
         assert_eq!(world_goodness(&world), 12.5);
-        assert_eq!(world.get::<&NodeState>(a).expect("node state").activation, 3.0);
+        assert_eq!(
+            world.get::<&NodeState>(a).expect("node state").activation,
+            3.0
+        );
     }
 
     fn classification_world() -> World {
@@ -236,7 +276,10 @@ mod tests {
             let pixel = input_entities[label];
             let label_input = input_entities[MNIST_IMAGE_PIXELS + label];
             world
-                .insert(entity, (TopologyPointers::new([pixel, label_input, entity]),))
+                .insert(
+                    entity,
+                    (TopologyPointers::new([pixel, label_input, entity]),),
+                )
                 .expect("attach classifier topology");
         }
 

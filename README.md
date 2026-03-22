@@ -102,6 +102,7 @@ Useful options:
 - `--checkpoint-every` saves `checkpoints/epoch-<N>.json` inside the run directory at the requested interval and on the final epoch.
 - `--save-checkpoint` writes an additional final checkpoint to a user-specified path.
 - `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
+- `--distributed-worker <host:port>` enables distributed training and evaluation by sending per-epoch work shards to one or more remote worker processes.
 
 The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `794` nodes as `InputNode`, and runs the per-tick schedule:
 
@@ -114,6 +115,41 @@ One epoch is defined as `2 * dataset_len` ticks so that the positive and negativ
 Forward-Forward evaluation uses the same sparse forward sweep without any weight updates. For each sample, the evaluator resets node activations, sweeps all candidate labels `0..9`, injects the conditioned sample, runs one forward sweep, and predicts the digit from the highest world goodness. `metrics.jsonl` records accuracy together with correct-label goodness, best-wrong-label goodness, and the resulting margin.
 
 Checkpoint files store stable node indices rather than raw `hecs::Entity` IDs, so the graph can be reconstructed exactly across process restarts.
+
+### Run Distributed Workers
+
+Start one worker process on each machine that should execute shards:
+
+```bash
+cargo run -- --worker-listen 0.0.0.0:7000
+```
+
+Then point the coordinator at those workers:
+
+```bash
+cargo run -- \
+  --train-images data/train-images-idx3-ubyte \
+  --train-labels data/train-labels-idx1-ubyte \
+  --test-images data/t10k-images-idx3-ubyte \
+  --test-labels data/t10k-labels-idx1-ubyte \
+  --epochs 5 \
+  --distributed-worker worker-a:7000 \
+  --distributed-worker worker-b:7000
+```
+
+Distributed execution currently uses synchronous data-parallel federated averaging at the epoch boundary:
+
+1. the coordinator snapshots the current world into the existing JSON checkpoint format,
+2. each worker receives the same world snapshot plus a disjoint dataset shard,
+3. every worker runs the normal local Forward-Forward tick schedule on its shard,
+4. the coordinator averages the returned activations and local weights elementwise,
+5. distributed evaluation reuses the same worker pool by partitioning dataset indices and aggregating the returned accuracy and goodness sums.
+
+Important constraints:
+
+- every worker must be able to read the same dataset paths passed to the coordinator, or equivalent paths mounted at the same location,
+- the current implementation is an epoch-level approximation of the single-process asynchronous schedule, not a fully partitioned cross-machine ECS world,
+- checkpoints, manifests, and metrics are still written only by the coordinator.
 
 ### Run Directory Layout
 
@@ -129,7 +165,7 @@ runs/
       epoch-000005.json
 ```
 
-- `manifest.json` records the effective training configuration, dataset paths, checkpoint settings, conditioning mode, and any resume source.
+- `manifest.json` records the effective training configuration, dataset paths, checkpoint settings, conditioning mode, distributed-worker settings, and any resume source.
 - `metrics.jsonl` appends one JSON record per epoch with activation, weight, training-phase goodness-separation metrics, and label-conditioned evaluation metrics. If an epoch skips evaluation because of `--eval-every`, the evaluation fields are `null`.
 - `checkpoints/epoch-<N>.json` stores periodic or final in-run checkpoints using the existing ECS checkpoint format.
 
@@ -188,11 +224,12 @@ Implemented:
 - label-sweep evaluation with accuracy and goodness-margin reporting,
 - run-directory manifests and per-epoch metrics JSONL output,
 - periodic checkpointing plus checkpoint resume metadata,
-- JSON checkpoint save/load for graph state persistence.
+- JSON checkpoint save/load for graph state persistence,
+- distributed worker-server mode with per-epoch federated averaging across physical workers.
 
 Not yet implemented:
 
-- distributed runtime across multiple physical workers.
+- true cross-machine partitioning of a single asynchronous ECS world without epoch-boundary averaging.
 
 ## License
 
