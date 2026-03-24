@@ -46,14 +46,6 @@ impl EvaluationAccumulator {
         self.margin_sum += evaluation.margin();
     }
 
-    pub fn merge(&mut self, other: Self) {
-        self.sample_count += other.sample_count;
-        self.correct_predictions += other.correct_predictions;
-        self.correct_goodness_sum += other.correct_goodness_sum;
-        self.best_wrong_goodness_sum += other.best_wrong_goodness_sum;
-        self.margin_sum += other.margin_sum;
-    }
-
     pub fn finish(self) -> EvaluationSummary {
         let sample_count = self.sample_count as f32;
         EvaluationSummary {

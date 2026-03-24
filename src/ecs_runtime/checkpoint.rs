@@ -176,6 +176,13 @@ pub fn save_checkpoint_json<P: AsRef<Path>>(
     phase: SimulationPhase,
 ) -> Result<(), CheckpointError> {
     let checkpoint = GraphCheckpoint::from_world(world, phase)?;
+    save_graph_checkpoint_json(path, &checkpoint)
+}
+
+pub fn save_graph_checkpoint_json<P: AsRef<Path>>(
+    path: P,
+    checkpoint: &GraphCheckpoint,
+) -> Result<(), CheckpointError> {
     let path = path.as_ref().to_path_buf();
     if let Some(parent) = path
         .parent()
@@ -187,7 +194,7 @@ pub fn save_checkpoint_json<P: AsRef<Path>>(
         })?;
     }
     let bytes =
-        serde_json::to_vec_pretty(&checkpoint).map_err(|source| CheckpointError::Serialize {
+        serde_json::to_vec_pretty(checkpoint).map_err(|source| CheckpointError::Serialize {
             path: path.clone(),
             source,
         })?;

@@ -102,7 +102,7 @@ Useful options:
 - `--checkpoint-every` saves `checkpoints/epoch-<N>.json` inside the run directory at the requested interval and on the final epoch.
 - `--save-checkpoint` writes an additional final checkpoint to a user-specified path.
 - `--load-checkpoint` resumes from a previously saved checkpoint instead of generating a fresh graph and weight initialization.
-- `--distributed-worker <host:port>` enables distributed training and evaluation by sending per-epoch work shards to one or more remote worker processes.
+- `--distributed-worker <host:port>` enables partitioned distributed execution across one or more remote worker processes.
 
 The binary constructs the verified sparse graph, spawns one ECS entity per graph node, tags the first `794` nodes as `InputNode`, and runs the per-tick schedule:
 
@@ -137,18 +137,18 @@ cargo run -- \
   --distributed-worker worker-b:7000
 ```
 
-Distributed execution currently uses synchronous data-parallel federated averaging at the epoch boundary:
+Distributed execution currently partitions the single sparse world across remote workers:
 
 1. the coordinator snapshots the current world into the existing JSON checkpoint format,
-2. each worker receives the same world snapshot plus a disjoint dataset shard,
-3. every worker runs the normal local Forward-Forward tick schedule on its shard,
-4. the coordinator averages the returned activations and local weights elementwise,
-5. distributed evaluation reuses the same worker pool by partitioning dataset indices and aggregating the returned accuracy and goodness sums.
+2. each worker receives only the graph nodes it owns together with their local weights and stable topology,
+3. conditioned input activations are pushed only to the workers that own those input nodes,
+4. the coordinator drives the asynchronous forward sweep in stable node order and routes each node update to the worker that owns it,
+5. after the forward sweep completes, the coordinator issues shard-local weight updates and keeps a mirrored full checkpoint for metrics, evaluation, and checkpoint saves.
 
 Important constraints:
 
-- every worker must be able to read the same dataset paths passed to the coordinator, or equivalent paths mounted at the same location,
-- the current implementation is an epoch-level approximation of the single-process asynchronous schedule, not a fully partitioned cross-machine ECS world,
+- the current implementation preserves a single distributed world without epoch-boundary averaging, but the coordinator still schedules cross-partition node updates and is therefore on the critical path,
+- distributed evaluation clones the current checkpoint into a separate temporary worker session so live training activations and weights are not mutated,
 - checkpoints, manifests, and metrics are still written only by the coordinator.
 
 ### Run Directory Layout
@@ -225,11 +225,7 @@ Implemented:
 - run-directory manifests and per-epoch metrics JSONL output,
 - periodic checkpointing plus checkpoint resume metadata,
 - JSON checkpoint save/load for graph state persistence,
-- distributed worker-server mode with per-epoch federated averaging across physical workers.
-
-Not yet implemented:
-
-- true cross-machine partitioning of a single asynchronous ECS world without epoch-boundary averaging.
+- distributed worker-server mode with true cross-machine partitioning of a single asynchronous ECS world.
 
 ## License
 

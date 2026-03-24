@@ -31,6 +31,7 @@ pub enum ConditioningMode {
 #[serde(rename_all = "snake_case")]
 pub enum DistributedExecutionStrategy {
     FederatedAveraging,
+    PartitionedWorld,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,7 +290,7 @@ impl ExperimentRun {
             conditioning_mode: ConditioningMode::LabelConditionedFf,
             distributed_workers: config.distributed_workers.clone(),
             distributed_strategy: (!config.distributed_workers.is_empty())
-                .then_some(DistributedExecutionStrategy::FederatedAveraging),
+                .then_some(DistributedExecutionStrategy::PartitionedWorld),
             eval_every: config.eval_every,
             checkpoint: CheckpointSettings {
                 checkpoint_every: config.checkpoint_every,

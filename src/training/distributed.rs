@@ -1,37 +1,36 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::Range;
 use std::thread;
 use std::time::Instant;
 
-use hecs::World;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::data::mnist_loader::{MnistDataset, MnistLoadError, MNIST_IMAGE_PIXELS};
-use crate::ecs_runtime::checkpoint::GraphNodeCheckpoint;
-use crate::ecs_runtime::checkpoint::{save_checkpoint_json, CheckpointError, GraphCheckpoint};
+use crate::data::mnist_loader::{MnistDataset, MNIST_IMAGE_PIXELS};
+use crate::ecs_runtime::checkpoint::{
+    save_graph_checkpoint_json, CheckpointError, GraphCheckpoint, GraphNodeCheckpoint,
+};
 use crate::ecs_runtime::ingestion_system::{
-    fill_negative_sample, fill_positive_sample, inject_conditioned_sample, IngestionError,
-    SimulationPhase,
+    fill_positive_sample, ContrastiveDataStream, IngestionError, SimulationPhase,
 };
-use crate::ecs_runtime::systems::{
-    update_local_weights_forward_forward, update_nodes_forward_forward, ActivationKind,
-    NodeUpdateError,
-};
-use crate::experiment::{ExperimentGoodness, ExperimentGoodnessAccumulator, ExperimentMetricError};
+use crate::ecs_runtime::systems::ActivationKind;
+use crate::experiment::{node_local_goodness, ExperimentGoodness};
+use crate::{CONDITIONED_INPUT_NODE_COUNT, MNIST_LABEL_CLASS_COUNT, REGULAR_DEGREE};
 
-use super::cli::{DatasetPaths, WorkerServerConfig};
-use super::eval::{evaluate_forward_forward_range, EvaluationAccumulator};
+use super::cli::WorkerServerConfig;
+use super::eval::EvaluationSummary;
+use super::world::WorldSummary;
 use super::{
-    summarize_world, EffectiveRunSettings, EvaluationError, ExperimentRun, MetricsRecord,
-    PreparedTrainingState, TrainingConfig, TrainingRunError, TrainingRunOutput,
+    EffectiveRunSettings, ExperimentRun, MetricsRecord, PreparedTrainingState, TrainingConfig,
+    TrainingRunError, TrainingRunOutput,
 };
 
-const DISTRIBUTED_PROTOCOL_VERSION: u32 = 1;
+const DISTRIBUTED_PROTOCOL_VERSION: u32 = 2;
 const MAX_MESSAGE_BYTES: usize = 512 * 1024 * 1024;
+const LABEL_SLOT_OFFSET: usize = MNIST_IMAGE_PIXELS;
 
 #[derive(Debug, Error)]
 pub enum DistributedRuntimeError {
@@ -63,32 +62,33 @@ pub enum DistributedRuntimeError {
     UnexpectedWorkerResponse { worker: String },
     #[error("worker {worker} reported an error: {message}")]
     WorkerError { worker: String, message: String },
-    #[error("distributed worker thread panicked")]
-    WorkerThreadPanicked,
-    #[error("distributed shard {start}..{end} is invalid for dataset length {dataset_len}")]
-    InvalidShard {
-        start: usize,
-        end: usize,
-        dataset_len: usize,
+    #[error("worker shard state has not been initialized")]
+    WorkerNotInitialized,
+    #[error("worker shard state has already been initialized for this connection")]
+    WorkerAlreadyInitialized,
+    #[error("worker shard contains duplicate node {node}")]
+    DuplicateOwnedNode { node: usize },
+    #[error("worker shard does not own node {node}")]
+    UnknownOwnedNode { node: usize },
+    #[error("failed to partition {node_count} nodes across {worker_count} workers")]
+    InvalidNodePartition {
+        node_count: usize,
+        worker_count: usize,
     },
-    #[error("distributed averaging requires at least one worker result")]
-    NoWorkerResults,
-    #[error("worker checkpoints are incompatible at node {node}: {reason}")]
-    IncompatibleCheckpoint { node: usize, reason: &'static str },
+    #[error(
+        "label-conditioned Forward-Forward requires at least {required} input nodes; found {found}"
+    )]
+    InsufficientInputNodes { found: usize, required: usize },
     #[error("distributed protocol message exceeds the {max_bytes}-byte safety limit")]
     MessageTooLarge { max_bytes: usize },
-    #[error("failed to load MNIST dataset on a distributed worker: {0}")]
-    MnistLoad(#[from] MnistLoadError),
     #[error("checkpoint operation failed during distributed execution: {0}")]
     Checkpoint(#[from] CheckpointError),
     #[error("data ingestion failed during distributed execution: {0}")]
     Ingestion(#[from] IngestionError),
-    #[error("forward-forward update failed during distributed execution: {0}")]
-    NodeUpdate(#[from] NodeUpdateError),
-    #[error("failed to compute experiment goodness during distributed execution: {0}")]
-    ExperimentMetric(#[from] ExperimentMetricError),
-    #[error("evaluation failed during distributed execution: {0}")]
-    Evaluation(#[from] EvaluationError),
+    #[error("distributed experiment goodness is missing positive observations")]
+    MissingPositiveSamples,
+    #[error("distributed experiment goodness is missing negative observations")]
+    MissingNegativeSamples,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +100,11 @@ struct WorkerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WorkerRequestPayload {
     Ping,
-    TrainShard(WorkerTrainShardRequest),
-    EvaluateShard(WorkerEvaluateShardRequest),
+    InitializeShard(InitializeShardRequest),
+    SetNodeActivations(SetNodeActivationsRequest),
+    ResetActivations,
+    ForwardNode(ForwardNodeRequest),
+    UpdateWeightsBatch(UpdateWeightsBatchRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,8 +116,9 @@ struct WorkerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WorkerResponsePayload {
     Pong,
-    TrainShard(WorkerTrainShardResponse),
-    EvaluateShard(WorkerEvaluateShardResponse),
+    Ack,
+    ForwardNode(ForwardNodeResponse),
+    UpdateWeightsBatch(UpdateWeightsBatchResponse),
     Error(WorkerErrorResponse),
 }
 
@@ -123,75 +127,148 @@ struct WorkerErrorResponse {
     message: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct ShardRange {
-    start: usize,
-    end: usize,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InitializeShardRequest {
+    nodes: Vec<GraphNodeCheckpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct ShardExperimentMetrics {
-    positive_mean_world_goodness: f32,
-    negative_mean_world_goodness: f32,
-    positive_samples: usize,
-    negative_samples: usize,
+struct NodeActivationPatch {
+    node_index: usize,
+    activation: f32,
 }
 
-impl From<ExperimentGoodness> for ShardExperimentMetrics {
-    fn from(value: ExperimentGoodness) -> Self {
-        Self {
-            positive_mean_world_goodness: value.positive_mean_world_goodness,
-            negative_mean_world_goodness: value.negative_mean_world_goodness,
-            positive_samples: value.positive_samples,
-            negative_samples: value.negative_samples,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SetNodeActivationsRequest {
+    patches: Vec<NodeActivationPatch>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ForwardNodeRequest {
+    node_index: usize,
+    neighbor_activations: [f32; REGULAR_DEGREE],
+    activation_kind: ActivationKind,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ForwardNodeResponse {
+    activation: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct WeightUpdateNodeRequest {
+    node_index: usize,
+    neighbor_activations: [f32; REGULAR_DEGREE],
+    phase: SimulationPhase,
+    learning_rate: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateWeightsBatchRequest {
+    updates: Vec<WeightUpdateNodeRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct WeightUpdateNodeResponse {
+    node_index: usize,
+    neighbor_weights: [f32; REGULAR_DEGREE],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateWeightsBatchResponse {
+    updates: Vec<WeightUpdateNodeResponse>,
+}
+
+struct WorkerShardState {
+    nodes: HashMap<usize, GraphNodeCheckpoint>,
+}
+
+impl WorkerShardState {
+    fn initialize(nodes: Vec<GraphNodeCheckpoint>) -> Result<Self, DistributedRuntimeError> {
+        let mut owned_nodes = HashMap::with_capacity(nodes.len());
+        for node in nodes {
+            let node_index = node.index;
+            if owned_nodes.insert(node_index, node).is_some() {
+                return Err(DistributedRuntimeError::DuplicateOwnedNode { node: node_index });
+            }
+        }
+
+        Ok(Self { nodes: owned_nodes })
+    }
+
+    fn set_node_activations(
+        &mut self,
+        patches: &[NodeActivationPatch],
+    ) -> Result<(), DistributedRuntimeError> {
+        for patch in patches {
+            self.node_mut(patch.node_index)?.activation = patch.activation;
+        }
+
+        Ok(())
+    }
+
+    fn reset_activations(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.activation = 0.0;
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerTrainShardRequest {
-    checkpoint: GraphCheckpoint,
-    dataset: DatasetPaths,
-    activation_kind: ActivationKind,
-    learning_rate: f32,
-    shard: ShardRange,
-}
+    fn forward_node(
+        &mut self,
+        request: ForwardNodeRequest,
+    ) -> Result<ForwardNodeResponse, DistributedRuntimeError> {
+        let node = self.node_mut(request.node_index)?;
+        let local_input_sum: f32 = node
+            .local_weights
+            .neighbor_weights
+            .iter()
+            .zip(request.neighbor_activations.iter())
+            .map(|(weight, activation)| weight * activation)
+            .sum();
+        let activation = request.activation_kind.apply(local_input_sum);
+        node.activation = activation;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerTrainShardResponse {
-    checkpoint: GraphCheckpoint,
-    experiment_goodness: ShardExperimentMetrics,
-}
+        Ok(ForwardNodeResponse { activation })
+    }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerEvaluateShardRequest {
-    checkpoint: GraphCheckpoint,
-    dataset: DatasetPaths,
-    activation_kind: ActivationKind,
-    shard: ShardRange,
-}
+    fn update_weights_batch(
+        &mut self,
+        request: UpdateWeightsBatchRequest,
+    ) -> Result<UpdateWeightsBatchResponse, DistributedRuntimeError> {
+        let mut updates = Vec::with_capacity(request.updates.len());
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerEvaluateShardResponse {
-    accumulator: EvaluationAccumulator,
-}
+        for update in request.updates {
+            let node = self.node_mut(update.node_index)?;
+            let local_activation = node.activation;
+            let goodness = node_local_goodness(local_activation, &update.neighbor_activations);
 
-#[derive(Default)]
-struct WorkerDatasetCache {
-    datasets: HashMap<DatasetPaths, MnistDataset>,
-}
+            for (slot, neighbor_activation) in
+                update.neighbor_activations.iter().copied().enumerate()
+            {
+                let local_correlation = local_activation * neighbor_activation;
+                let delta = update.phase.learning_direction()
+                    * update.learning_rate
+                    * goodness
+                    * local_correlation;
+                node.local_weights.neighbor_weights[slot] += delta;
+            }
 
-impl WorkerDatasetCache {
-    fn load(&mut self, paths: &DatasetPaths) -> Result<&MnistDataset, DistributedRuntimeError> {
-        if !self.datasets.contains_key(paths) {
-            let dataset = MnistDataset::load(&paths.images, &paths.labels)?;
-            self.datasets.insert(paths.clone(), dataset);
+            updates.push(WeightUpdateNodeResponse {
+                node_index: update.node_index,
+                neighbor_weights: node.local_weights.neighbor_weights,
+            });
         }
 
-        Ok(self
-            .datasets
-            .get(paths)
-            .expect("dataset cache entry should exist after load"))
+        Ok(UpdateWeightsBatchResponse { updates })
+    }
+
+    fn node_mut(
+        &mut self,
+        node_index: usize,
+    ) -> Result<&mut GraphNodeCheckpoint, DistributedRuntimeError> {
+        self.nodes
+            .get_mut(&node_index)
+            .ok_or(DistributedRuntimeError::UnknownOwnedNode { node: node_index })
     }
 }
 
@@ -201,7 +278,6 @@ pub fn run_worker_server(config: WorkerServerConfig) -> Result<(), DistributedRu
             addr: config.listen_addr.clone(),
             source,
         })?;
-    let mut dataset_cache = WorkerDatasetCache::default();
 
     println!("distributed worker listening on {}", config.listen_addr);
 
@@ -213,11 +289,11 @@ pub fn run_worker_server(config: WorkerServerConfig) -> Result<(), DistributedRu
                     addr: config.listen_addr.clone(),
                     source,
                 })?;
-        if let Err(error) =
-            handle_worker_connection(stream, &peer_addr.to_string(), &mut dataset_cache)
-        {
-            eprintln!("worker request failed: {error}");
-        }
+        thread::spawn(move || {
+            if let Err(error) = handle_worker_connection(stream, &peer_addr.to_string()) {
+                eprintln!("worker request failed: {error}");
+            }
+        });
     }
 }
 
@@ -232,14 +308,17 @@ pub(crate) fn run_distributed_training(
     let PreparedTrainingState {
         train_dataset,
         test_dataset,
-        mut world,
-        mut phase,
+        world,
+        phase,
         effective_graph_search_limit,
         world_node_count,
         input_node_count,
     } = prepared;
 
-    ping_workers(&config.distributed_workers)?;
+    let mut runtime = DistributedCheckpointRuntime::connect(
+        &config.distributed_workers,
+        GraphCheckpoint::from_world(&world, phase)?,
+    )?;
 
     let mut experiment = ExperimentRun::prepare(
         &config,
@@ -250,27 +329,29 @@ pub(crate) fn run_distributed_training(
     )?;
     let final_epoch = experiment.starting_epoch() + config.epochs;
     let eval_dataset = test_dataset.as_ref().unwrap_or(&train_dataset);
-    let eval_paths = config.test.as_ref().unwrap_or(&config.train);
+    let mut stream = ContrastiveDataStream::new(&train_dataset)?;
     let ticks_per_epoch =
-        train_dataset
+        stream
+            .dataset()
             .len()
             .checked_mul(2)
             .ok_or(TrainingRunError::TickCountOverflow {
-                dataset_len: train_dataset.len(),
+                dataset_len: stream.dataset().len(),
                 epochs: config.epochs,
             })?;
     let total_ticks =
         ticks_per_epoch
             .checked_mul(config.epochs)
             .ok_or(TrainingRunError::TickCountOverflow {
-                dataset_len: train_dataset.len(),
+                dataset_len: stream.dataset().len(),
                 epochs: config.epochs,
             })?;
     let run_started = Instant::now();
+    let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
 
     println!("run directory: {}", experiment.root().display());
     println!(
-        "starting distributed training: start_epoch={} end_epoch={} epochs_this_invocation={} ticks_per_epoch={} total_ticks={} activation={} learning_rate={} graph_node_count={} input_node_count={} weight_seed={} weight_init_scale={} eval_every={} checkpoint_every={} workers={} strategy=federated_averaging",
+        "starting distributed training: start_epoch={} end_epoch={} epochs_this_invocation={} ticks_per_epoch={} total_ticks={} activation={} learning_rate={} graph_node_count={} input_node_count={} weight_seed={} weight_init_scale={} eval_every={} checkpoint_every={} workers={} strategy=partitioned_world",
         experiment.starting_epoch(),
         final_epoch,
         config.epochs,
@@ -287,38 +368,33 @@ pub(crate) fn run_distributed_training(
             .checkpoint_every
             .map(|value| value.to_string())
             .unwrap_or_else(|| "disabled".to_owned()),
-        config.distributed_workers.len(),
+        runtime.worker_count(),
     );
 
     for epoch_offset in 0..config.epochs {
         let epoch = experiment.starting_epoch() + epoch_offset + 1;
-        let base_checkpoint = GraphCheckpoint::from_world(&world, phase)?;
-        let reports = dispatch_training_shards(
-            &config.distributed_workers,
-            &config.train,
-            &base_checkpoint,
-            &train_dataset,
-            config.activation_kind,
-            config.learning_rate,
-        )?;
-        let experiment_goodness = aggregate_experiment_goodness(&reports)?;
-        let averaged_checkpoint = average_checkpoints(
-            &reports
-                .into_iter()
-                .map(|report| report.checkpoint)
-                .collect::<Vec<_>>(),
-        )?;
-        let (averaged_world, averaged_phase) = averaged_checkpoint.into_world()?;
-        world = averaged_world;
-        phase = averaged_phase;
+        let mut experiment_goodness = PhaseGoodnessAccumulator::default();
 
-        let summary = summarize_world(&world);
+        for _tick in 0..ticks_per_epoch {
+            let sample_phase = runtime.phase();
+            let metadata = match sample_phase {
+                SimulationPhase::Positive => stream.fill_next_positive(&mut pixels)?,
+                SimulationPhase::Negative => stream.fill_next_negative(&mut pixels)?,
+            };
+
+            runtime.apply_conditioned_sample(&pixels, metadata.candidate_label)?;
+            runtime.set_phase(sample_phase.toggled());
+            runtime.forward_sweep(config.activation_kind)?;
+            experiment_goodness.observe(sample_phase, runtime.mean_world_goodness());
+            runtime.update_weights(sample_phase, config.learning_rate)?;
+        }
+
+        let summary = runtime.summary();
+        let experiment_goodness = experiment_goodness.finish()?;
         let evaluation = if epoch % config.eval_every == 0 {
-            Some(dispatch_evaluation_shards(
+            Some(evaluate_partitioned_world(
                 &config.distributed_workers,
-                eval_paths,
-                &world,
-                phase,
+                runtime.checkpoint(),
                 eval_dataset,
                 config.activation_kind,
             )?)
@@ -336,7 +412,7 @@ pub(crate) fn run_distributed_training(
 
         if experiment.should_save_periodic_checkpoint(epoch, final_epoch) {
             let checkpoint_path = experiment.checkpoint_path_for_epoch(epoch);
-            save_checkpoint_json(&checkpoint_path, &world, phase)?;
+            save_graph_checkpoint_json(&checkpoint_path, runtime.checkpoint())?;
             experiment.record_checkpoint(&checkpoint_path, epoch)?;
             println!("saved checkpoint to {}", checkpoint_path.display());
         }
@@ -369,7 +445,7 @@ pub(crate) fn run_distributed_training(
     }
 
     if let Some(path) = &config.save_checkpoint {
-        save_checkpoint_json(path, &world, phase)?;
+        save_graph_checkpoint_json(path, runtime.checkpoint())?;
         experiment.record_checkpoint(path, final_epoch)?;
         println!("saved final checkpoint to {}", path.display());
     }
@@ -390,43 +466,337 @@ pub(crate) fn run_distributed_training(
     })
 }
 
-fn ping_workers(workers: &[String]) -> Result<(), DistributedRuntimeError> {
-    for worker in workers {
-        match request_worker(worker, WorkerRequestPayload::Ping)? {
+struct DistributedCheckpointRuntime {
+    checkpoint: GraphCheckpoint,
+    workers: Vec<PartitionedWorkerClient>,
+    owner_by_node: Vec<usize>,
+    input_node_indices: Vec<usize>,
+}
+
+impl DistributedCheckpointRuntime {
+    fn connect(
+        worker_addresses: &[String],
+        checkpoint: GraphCheckpoint,
+    ) -> Result<Self, DistributedRuntimeError> {
+        let assignments = partition_node_ranges(worker_addresses, checkpoint.nodes.len())?;
+        let mut workers = Vec::with_capacity(assignments.len());
+        let mut owner_by_node = vec![0usize; checkpoint.nodes.len()];
+
+        for (worker_index, (worker, range)) in assignments.into_iter().enumerate() {
+            for node_index in range.clone() {
+                owner_by_node[node_index] = worker_index;
+            }
+            let shard_nodes = checkpoint.nodes[range.clone()].to_vec();
+            workers.push(PartitionedWorkerClient::connect(
+                worker,
+                range,
+                shard_nodes,
+            )?);
+        }
+
+        let input_node_indices: Vec<usize> = checkpoint
+            .nodes
+            .iter()
+            .filter(|node| node.is_input)
+            .map(|node| node.index)
+            .collect();
+        if input_node_indices.len() < CONDITIONED_INPUT_NODE_COUNT {
+            return Err(DistributedRuntimeError::InsufficientInputNodes {
+                found: input_node_indices.len(),
+                required: CONDITIONED_INPUT_NODE_COUNT,
+            });
+        }
+
+        Ok(Self {
+            checkpoint,
+            workers,
+            owner_by_node,
+            input_node_indices,
+        })
+    }
+
+    fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    fn checkpoint(&self) -> &GraphCheckpoint {
+        &self.checkpoint
+    }
+
+    fn phase(&self) -> SimulationPhase {
+        self.checkpoint.phase
+    }
+
+    fn set_phase(&mut self, phase: SimulationPhase) {
+        self.checkpoint.phase = phase;
+    }
+
+    fn apply_conditioned_sample(
+        &mut self,
+        pixels: &[f32; MNIST_IMAGE_PIXELS],
+        candidate_label: u8,
+    ) -> Result<(), DistributedRuntimeError> {
+        let mut patches_by_worker = vec![Vec::new(); self.workers.len()];
+
+        for (slot, node_index) in self.input_node_indices.iter().copied().enumerate() {
+            let activation = conditioned_slot_activation(pixels, slot, candidate_label);
+            self.checkpoint.nodes[node_index].activation = activation;
+            patches_by_worker[self.owner_by_node[node_index]].push(NodeActivationPatch {
+                node_index,
+                activation,
+            });
+        }
+
+        for (worker_index, patches) in patches_by_worker.into_iter().enumerate() {
+            if !patches.is_empty() {
+                self.workers[worker_index].set_node_activations(patches)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset_activations(&mut self) -> Result<(), DistributedRuntimeError> {
+        for node in &mut self.checkpoint.nodes {
+            node.activation = 0.0;
+        }
+
+        for worker in &mut self.workers {
+            worker.reset_activations()?;
+        }
+
+        Ok(())
+    }
+
+    fn forward_sweep(
+        &mut self,
+        activation_kind: ActivationKind,
+    ) -> Result<(), DistributedRuntimeError> {
+        for node_index in 0..self.checkpoint.nodes.len() {
+            let neighbor_activations = neighbor_activations(&self.checkpoint, node_index);
+            let owner = self.owner_by_node[node_index];
+            let activation = self.workers[owner].forward_node(
+                node_index,
+                neighbor_activations,
+                activation_kind,
+            )?;
+            self.checkpoint.nodes[node_index].activation = activation;
+        }
+
+        Ok(())
+    }
+
+    fn update_weights(
+        &mut self,
+        phase: SimulationPhase,
+        learning_rate: f32,
+    ) -> Result<(), DistributedRuntimeError> {
+        let mut updates_by_worker = vec![Vec::new(); self.workers.len()];
+
+        for node_index in 0..self.checkpoint.nodes.len() {
+            updates_by_worker[self.owner_by_node[node_index]].push(WeightUpdateNodeRequest {
+                node_index,
+                neighbor_activations: neighbor_activations(&self.checkpoint, node_index),
+                phase,
+                learning_rate,
+            });
+        }
+
+        for (worker_index, updates) in updates_by_worker.into_iter().enumerate() {
+            if updates.is_empty() {
+                continue;
+            }
+
+            let response = self.workers[worker_index].update_weights_batch(updates)?;
+            for update in response.updates {
+                self.checkpoint.nodes[update.node_index]
+                    .local_weights
+                    .neighbor_weights = update.neighbor_weights;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mean_world_goodness(&self) -> f32 {
+        mean_world_goodness_from_checkpoint(&self.checkpoint)
+    }
+
+    fn summary(&self) -> WorldSummary {
+        summarize_checkpoint(&self.checkpoint)
+    }
+}
+
+struct PartitionedWorkerClient {
+    worker: String,
+    node_range: Range<usize>,
+    stream: TcpStream,
+}
+
+impl PartitionedWorkerClient {
+    fn connect(
+        worker: String,
+        node_range: Range<usize>,
+        shard_nodes: Vec<GraphNodeCheckpoint>,
+    ) -> Result<Self, DistributedRuntimeError> {
+        let stream =
+            TcpStream::connect(&worker).map_err(|source| DistributedRuntimeError::Transport {
+                context: worker.clone(),
+                source,
+            })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|source| DistributedRuntimeError::Transport {
+                context: worker.clone(),
+                source,
+            })?;
+
+        let mut client = Self {
+            worker,
+            node_range,
+            stream,
+        };
+
+        match client.request(WorkerRequestPayload::Ping)? {
             WorkerResponsePayload::Pong => {}
             _ => {
                 return Err(DistributedRuntimeError::UnexpectedWorkerResponse {
-                    worker: worker.clone(),
+                    worker: client.worker.clone(),
                 });
             }
         }
+
+        client.initialize_shard(shard_nodes)?;
+        Ok(client)
     }
 
-    Ok(())
+    fn initialize_shard(
+        &mut self,
+        shard_nodes: Vec<GraphNodeCheckpoint>,
+    ) -> Result<(), DistributedRuntimeError> {
+        match self.request(WorkerRequestPayload::InitializeShard(
+            InitializeShardRequest { nodes: shard_nodes },
+        ))? {
+            WorkerResponsePayload::Ack => Ok(()),
+            _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse {
+                worker: self.worker.clone(),
+            }),
+        }
+    }
+
+    fn set_node_activations(
+        &mut self,
+        patches: Vec<NodeActivationPatch>,
+    ) -> Result<(), DistributedRuntimeError> {
+        match self.request(WorkerRequestPayload::SetNodeActivations(
+            SetNodeActivationsRequest { patches },
+        ))? {
+            WorkerResponsePayload::Ack => Ok(()),
+            _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse {
+                worker: self.worker.clone(),
+            }),
+        }
+    }
+
+    fn reset_activations(&mut self) -> Result<(), DistributedRuntimeError> {
+        match self.request(WorkerRequestPayload::ResetActivations)? {
+            WorkerResponsePayload::Ack => Ok(()),
+            _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse {
+                worker: self.worker.clone(),
+            }),
+        }
+    }
+
+    fn forward_node(
+        &mut self,
+        node_index: usize,
+        neighbor_activations: [f32; REGULAR_DEGREE],
+        activation_kind: ActivationKind,
+    ) -> Result<f32, DistributedRuntimeError> {
+        debug_assert!(self.node_range.contains(&node_index));
+
+        match self.request(WorkerRequestPayload::ForwardNode(ForwardNodeRequest {
+            node_index,
+            neighbor_activations,
+            activation_kind,
+        }))? {
+            WorkerResponsePayload::ForwardNode(response) => Ok(response.activation),
+            _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse {
+                worker: self.worker.clone(),
+            }),
+        }
+    }
+
+    fn update_weights_batch(
+        &mut self,
+        updates: Vec<WeightUpdateNodeRequest>,
+    ) -> Result<UpdateWeightsBatchResponse, DistributedRuntimeError> {
+        match self.request(WorkerRequestPayload::UpdateWeightsBatch(
+            UpdateWeightsBatchRequest { updates },
+        ))? {
+            WorkerResponsePayload::UpdateWeightsBatch(response) => Ok(response),
+            _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse {
+                worker: self.worker.clone(),
+            }),
+        }
+    }
+
+    fn request(
+        &mut self,
+        payload: WorkerRequestPayload,
+    ) -> Result<WorkerResponsePayload, DistributedRuntimeError> {
+        let request = WorkerRequest {
+            protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            payload,
+        };
+        write_message(&mut self.stream, &self.worker, &request)?;
+        let response: WorkerResponse = read_message(&mut self.stream, &self.worker)?;
+
+        if response.protocol_version != DISTRIBUTED_PROTOCOL_VERSION {
+            return Err(DistributedRuntimeError::ProtocolVersionMismatch {
+                local: DISTRIBUTED_PROTOCOL_VERSION,
+                remote: response.protocol_version,
+            });
+        }
+
+        match response.payload {
+            WorkerResponsePayload::Error(error) => Err(DistributedRuntimeError::WorkerError {
+                worker: self.worker.clone(),
+                message: error.message,
+            }),
+            payload => Ok(payload),
+        }
+    }
 }
 
 fn handle_worker_connection(
     mut stream: TcpStream,
     peer: &str,
-    dataset_cache: &mut WorkerDatasetCache,
 ) -> Result<(), DistributedRuntimeError> {
-    let request: WorkerRequest = read_message(&mut stream, peer)?;
-    let payload = match handle_worker_request(request, dataset_cache) {
-        Ok(payload) => payload,
-        Err(error) => WorkerResponsePayload::Error(WorkerErrorResponse {
-            message: error.to_string(),
-        }),
-    };
-    let response = WorkerResponse {
-        protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
-        payload,
-    };
-    write_message(&mut stream, peer, &response)
+    let mut shard_state: Option<WorkerShardState> = None;
+
+    loop {
+        let request: WorkerRequest = match try_read_message(&mut stream, peer)? {
+            Some(request) => request,
+            None => return Ok(()),
+        };
+        let payload = match handle_worker_request(request, &mut shard_state) {
+            Ok(payload) => payload,
+            Err(error) => WorkerResponsePayload::Error(WorkerErrorResponse {
+                message: error.to_string(),
+            }),
+        };
+        let response = WorkerResponse {
+            protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
+            payload,
+        };
+        write_message(&mut stream, peer, &response)?;
+    }
 }
 
 fn handle_worker_request(
     request: WorkerRequest,
-    dataset_cache: &mut WorkerDatasetCache,
+    shard_state: &mut Option<WorkerShardState>,
 ) -> Result<WorkerResponsePayload, DistributedRuntimeError> {
     if request.protocol_version != DISTRIBUTED_PROTOCOL_VERSION {
         return Err(DistributedRuntimeError::ProtocolVersionMismatch {
@@ -437,224 +807,271 @@ fn handle_worker_request(
 
     match request.payload {
         WorkerRequestPayload::Ping => Ok(WorkerResponsePayload::Pong),
-        WorkerRequestPayload::TrainShard(request) => {
-            let dataset = dataset_cache.load(&request.dataset)?;
-            Ok(WorkerResponsePayload::TrainShard(execute_training_shard(
-                request.checkpoint,
-                dataset,
-                request.activation_kind,
-                request.learning_rate,
-                request.shard,
-            )?))
+        WorkerRequestPayload::InitializeShard(request) => {
+            if shard_state.is_some() {
+                return Err(DistributedRuntimeError::WorkerAlreadyInitialized);
+            }
+
+            *shard_state = Some(WorkerShardState::initialize(request.nodes)?);
+            Ok(WorkerResponsePayload::Ack)
         }
-        WorkerRequestPayload::EvaluateShard(request) => {
-            let dataset = dataset_cache.load(&request.dataset)?;
-            Ok(WorkerResponsePayload::EvaluateShard(
-                execute_evaluation_shard(
-                    request.checkpoint,
-                    dataset,
-                    request.activation_kind,
-                    request.shard,
-                )?,
+        WorkerRequestPayload::SetNodeActivations(request) => {
+            shard_state
+                .as_mut()
+                .ok_or(DistributedRuntimeError::WorkerNotInitialized)?
+                .set_node_activations(&request.patches)?;
+            Ok(WorkerResponsePayload::Ack)
+        }
+        WorkerRequestPayload::ResetActivations => {
+            shard_state
+                .as_mut()
+                .ok_or(DistributedRuntimeError::WorkerNotInitialized)?
+                .reset_activations();
+            Ok(WorkerResponsePayload::Ack)
+        }
+        WorkerRequestPayload::ForwardNode(request) => Ok(WorkerResponsePayload::ForwardNode(
+            shard_state
+                .as_mut()
+                .ok_or(DistributedRuntimeError::WorkerNotInitialized)?
+                .forward_node(request)?,
+        )),
+        WorkerRequestPayload::UpdateWeightsBatch(request) => {
+            Ok(WorkerResponsePayload::UpdateWeightsBatch(
+                shard_state
+                    .as_mut()
+                    .ok_or(DistributedRuntimeError::WorkerNotInitialized)?
+                    .update_weights_batch(request)?,
             ))
         }
     }
 }
 
-fn execute_training_shard(
-    checkpoint: GraphCheckpoint,
-    dataset: &MnistDataset,
-    activation_kind: ActivationKind,
-    learning_rate: f32,
-    shard: ShardRange,
-) -> Result<WorkerTrainShardResponse, DistributedRuntimeError> {
-    validate_shard(shard, dataset.len())?;
-
-    let (mut world, mut phase) = checkpoint.into_world()?;
-    let mut experiment_goodness = ExperimentGoodnessAccumulator::new();
-    let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
-
-    for sample_index in shard.start..shard.end {
-        execute_training_tick(
-            &mut world,
-            &mut phase,
-            dataset,
-            sample_index,
-            activation_kind,
-            learning_rate,
-            &mut pixels,
-            &mut experiment_goodness,
-        )?;
-        execute_training_tick(
-            &mut world,
-            &mut phase,
-            dataset,
-            sample_index,
-            activation_kind,
-            learning_rate,
-            &mut pixels,
-            &mut experiment_goodness,
-        )?;
-    }
-
-    let experiment_goodness = experiment_goodness.finish()?;
-    Ok(WorkerTrainShardResponse {
-        checkpoint: GraphCheckpoint::from_world(&world, phase)?,
-        experiment_goodness: experiment_goodness.into(),
-    })
-}
-
-fn execute_training_tick(
-    world: &mut World,
-    phase: &mut SimulationPhase,
-    dataset: &MnistDataset,
-    sample_index: usize,
-    activation_kind: ActivationKind,
-    learning_rate: f32,
-    pixels: &mut [f32; MNIST_IMAGE_PIXELS],
-    experiment_goodness: &mut ExperimentGoodnessAccumulator,
-) -> Result<(), DistributedRuntimeError> {
-    let sample_phase = *phase;
-    let metadata = match sample_phase {
-        SimulationPhase::Positive => fill_positive_sample(dataset, sample_index, pixels)?,
-        SimulationPhase::Negative => fill_negative_sample(dataset, sample_index, pixels)?,
-    };
-
-    inject_conditioned_sample(world, pixels, metadata.candidate_label)?;
-    *phase = phase.toggled();
-    update_nodes_forward_forward(world, activation_kind)?;
-    experiment_goodness.observe_world(world, sample_phase)?;
-    update_local_weights_forward_forward(world, sample_phase, learning_rate)?;
-
-    Ok(())
-}
-
-fn execute_evaluation_shard(
-    checkpoint: GraphCheckpoint,
-    dataset: &MnistDataset,
-    activation_kind: ActivationKind,
-    shard: ShardRange,
-) -> Result<WorkerEvaluateShardResponse, DistributedRuntimeError> {
-    validate_shard(shard, dataset.len())?;
-    let (world, phase) = checkpoint.into_world()?;
-    let accumulator =
-        evaluate_forward_forward_range(&world, phase, dataset, activation_kind, shard.range())?;
-
-    Ok(WorkerEvaluateShardResponse { accumulator })
-}
-
-fn dispatch_training_shards(
-    workers: &[String],
-    dataset_paths: &DatasetPaths,
+fn evaluate_partitioned_world(
+    worker_addresses: &[String],
     checkpoint: &GraphCheckpoint,
     dataset: &MnistDataset,
     activation_kind: ActivationKind,
-    learning_rate: f32,
-) -> Result<Vec<WorkerTrainShardResponse>, DistributedRuntimeError> {
-    let assignments = partition_shards(workers, dataset.len())?;
-    let mut handles = Vec::with_capacity(assignments.len());
+) -> Result<EvaluationSummary, DistributedRuntimeError> {
+    let mut runtime = DistributedCheckpointRuntime::connect(worker_addresses, checkpoint.clone())?;
+    let mut pixels = [0.0f32; MNIST_IMAGE_PIXELS];
+    let mut correct_predictions = 0usize;
+    let mut correct_goodness_sum = 0.0f32;
+    let mut best_wrong_goodness_sum = 0.0f32;
+    let mut margin_sum = 0.0f32;
 
-    for (worker, shard) in assignments {
-        let request = WorkerTrainShardRequest {
-            checkpoint: checkpoint.clone(),
-            dataset: dataset_paths.clone(),
-            activation_kind,
-            learning_rate,
-            shard,
-        };
-        handles.push(thread::spawn(move || {
-            let response = request_worker(&worker, WorkerRequestPayload::TrainShard(request))?;
-            match response {
-                WorkerResponsePayload::TrainShard(response) => Ok(response),
-                _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse { worker }),
-            }
-        }));
+    for index in 0..dataset.len() {
+        let sample = fill_positive_sample(dataset, index, &mut pixels)?;
+        let evaluation =
+            evaluate_conditioned_pixels(&mut runtime, &pixels, sample.true_label, activation_kind)?;
+
+        correct_predictions += usize::from(evaluation.predicted_label == sample.true_label);
+        correct_goodness_sum += evaluation.correct_goodness;
+        best_wrong_goodness_sum += evaluation.best_wrong_goodness;
+        margin_sum += evaluation.margin();
     }
 
-    collect_thread_results(handles)
+    let sample_count = dataset.len() as f32;
+    Ok(EvaluationSummary {
+        accuracy: correct_predictions as f32 / sample_count,
+        mean_correct_goodness: correct_goodness_sum / sample_count,
+        mean_best_wrong_goodness: best_wrong_goodness_sum / sample_count,
+        mean_margin: margin_sum / sample_count,
+    })
 }
 
-fn dispatch_evaluation_shards(
-    workers: &[String],
-    dataset_paths: &DatasetPaths,
-    world: &World,
-    phase: SimulationPhase,
-    dataset: &MnistDataset,
+fn evaluate_conditioned_pixels(
+    runtime: &mut DistributedCheckpointRuntime,
+    pixels: &[f32; MNIST_IMAGE_PIXELS],
+    true_label: u8,
     activation_kind: ActivationKind,
-) -> Result<super::EvaluationSummary, DistributedRuntimeError> {
-    let assignments = partition_shards(workers, dataset.len())?;
-    let checkpoint = GraphCheckpoint::from_world(world, phase)?;
-    let mut handles = Vec::with_capacity(assignments.len());
+) -> Result<DistributedSampleEvaluation, DistributedRuntimeError> {
+    let mut predicted_label = 0u8;
+    let mut predicted_goodness = f32::NEG_INFINITY;
+    let mut correct_goodness = f32::NEG_INFINITY;
+    let mut best_wrong_goodness = f32::NEG_INFINITY;
 
-    for (worker, shard) in assignments {
-        let request = WorkerEvaluateShardRequest {
-            checkpoint: checkpoint.clone(),
-            dataset: dataset_paths.clone(),
-            activation_kind,
-            shard,
-        };
-        handles.push(thread::spawn(move || {
-            let response = request_worker(&worker, WorkerRequestPayload::EvaluateShard(request))?;
-            match response {
-                WorkerResponsePayload::EvaluateShard(response) => Ok(response),
-                _ => Err(DistributedRuntimeError::UnexpectedWorkerResponse { worker }),
+    for candidate_label in 0..MNIST_LABEL_CLASS_COUNT as u8 {
+        runtime.reset_activations()?;
+        runtime.apply_conditioned_sample(pixels, candidate_label)?;
+        runtime.forward_sweep(activation_kind)?;
+        let goodness = runtime.mean_world_goodness();
+
+        if goodness > predicted_goodness {
+            predicted_label = candidate_label;
+            predicted_goodness = goodness;
+        }
+
+        if candidate_label == true_label {
+            correct_goodness = goodness;
+        } else if goodness > best_wrong_goodness {
+            best_wrong_goodness = goodness;
+        }
+    }
+
+    Ok(DistributedSampleEvaluation {
+        predicted_label,
+        correct_goodness,
+        best_wrong_goodness,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DistributedSampleEvaluation {
+    predicted_label: u8,
+    correct_goodness: f32,
+    best_wrong_goodness: f32,
+}
+
+impl DistributedSampleEvaluation {
+    fn margin(self) -> f32 {
+        self.correct_goodness - self.best_wrong_goodness
+    }
+}
+
+#[derive(Default)]
+struct PhaseGoodnessAccumulator {
+    positive_goodness_sum: f32,
+    negative_goodness_sum: f32,
+    positive_samples: usize,
+    negative_samples: usize,
+}
+
+impl PhaseGoodnessAccumulator {
+    fn observe(&mut self, phase: SimulationPhase, mean_world_goodness: f32) {
+        match phase {
+            SimulationPhase::Positive => {
+                self.positive_goodness_sum += mean_world_goodness;
+                self.positive_samples += 1;
             }
-        }));
+            SimulationPhase::Negative => {
+                self.negative_goodness_sum += mean_world_goodness;
+                self.negative_samples += 1;
+            }
+        }
     }
 
-    let mut accumulator = EvaluationAccumulator::default();
-    for response in collect_thread_results(handles)? {
-        accumulator.merge(response.accumulator);
-    }
+    fn finish(self) -> Result<ExperimentGoodness, DistributedRuntimeError> {
+        if self.positive_samples == 0 {
+            return Err(DistributedRuntimeError::MissingPositiveSamples);
+        }
+        if self.negative_samples == 0 {
+            return Err(DistributedRuntimeError::MissingNegativeSamples);
+        }
 
-    Ok(accumulator.finish())
+        let positive_mean_world_goodness =
+            self.positive_goodness_sum / self.positive_samples as f32;
+        let negative_mean_world_goodness =
+            self.negative_goodness_sum / self.negative_samples as f32;
+
+        Ok(ExperimentGoodness {
+            positive_mean_world_goodness,
+            negative_mean_world_goodness,
+            goodness_separation: positive_mean_world_goodness - negative_mean_world_goodness,
+            positive_samples: self.positive_samples,
+            negative_samples: self.negative_samples,
+        })
+    }
 }
 
-fn collect_thread_results<T>(
-    handles: Vec<thread::JoinHandle<Result<T, DistributedRuntimeError>>>,
-) -> Result<Vec<T>, DistributedRuntimeError> {
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(
-            handle
-                .join()
-                .map_err(|_| DistributedRuntimeError::WorkerThreadPanicked)??,
-        );
-    }
-
-    Ok(results)
+fn neighbor_activations(checkpoint: &GraphCheckpoint, node_index: usize) -> [f32; REGULAR_DEGREE] {
+    std::array::from_fn(|slot| {
+        let neighbor_index = checkpoint.nodes[node_index].topology.neighbors[slot];
+        checkpoint.nodes[neighbor_index].activation
+    })
 }
 
-fn request_worker(
-    worker: &str,
-    payload: WorkerRequestPayload,
-) -> Result<WorkerResponsePayload, DistributedRuntimeError> {
-    let mut stream =
-        TcpStream::connect(worker).map_err(|source| DistributedRuntimeError::Transport {
-            context: worker.to_owned(),
-            source,
-        })?;
-    let request = WorkerRequest {
-        protocol_version: DISTRIBUTED_PROTOCOL_VERSION,
-        payload,
-    };
-    write_message(&mut stream, worker, &request)?;
-    let response: WorkerResponse = read_message(&mut stream, worker)?;
+fn mean_world_goodness_from_checkpoint(checkpoint: &GraphCheckpoint) -> f32 {
+    let goodness_sum = checkpoint
+        .nodes
+        .iter()
+        .map(|node| {
+            node_local_goodness(
+                node.activation,
+                &std::array::from_fn(|slot| {
+                    checkpoint.nodes[node.topology.neighbors[slot]].activation
+                }),
+            )
+        })
+        .sum::<f32>();
 
-    if response.protocol_version != DISTRIBUTED_PROTOCOL_VERSION {
-        return Err(DistributedRuntimeError::ProtocolVersionMismatch {
-            local: DISTRIBUTED_PROTOCOL_VERSION,
-            remote: response.protocol_version,
+    goodness_sum / checkpoint.nodes.len() as f32
+}
+
+fn summarize_checkpoint(checkpoint: &GraphCheckpoint) -> WorldSummary {
+    let activation_count = checkpoint.nodes.len() as f32;
+    let weight_count = (checkpoint.nodes.len() * REGULAR_DEGREE) as f32;
+    let abs_activation_sum = checkpoint
+        .nodes
+        .iter()
+        .map(|node| node.activation.abs())
+        .sum::<f32>();
+    let squared_activation_sum = checkpoint
+        .nodes
+        .iter()
+        .map(|node| node.activation * node.activation)
+        .sum::<f32>();
+    let abs_weight_sum = checkpoint
+        .nodes
+        .iter()
+        .flat_map(|node| node.local_weights.neighbor_weights)
+        .map(f32::abs)
+        .sum::<f32>();
+
+    WorldSummary {
+        mean_abs_activation: abs_activation_sum / activation_count,
+        mean_squared_activation: squared_activation_sum / activation_count,
+        mean_abs_weight: abs_weight_sum / weight_count,
+    }
+}
+
+fn conditioned_slot_activation(
+    pixels: &[f32; MNIST_IMAGE_PIXELS],
+    slot: usize,
+    candidate_label: u8,
+) -> f32 {
+    if slot < LABEL_SLOT_OFFSET {
+        return pixels[slot];
+    }
+
+    if slot < CONDITIONED_INPUT_NODE_COUNT {
+        return if slot - LABEL_SLOT_OFFSET == usize::from(candidate_label) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+
+    0.0
+}
+
+fn partition_node_ranges(
+    workers: &[String],
+    node_count: usize,
+) -> Result<Vec<(String, Range<usize>)>, DistributedRuntimeError> {
+    if workers.is_empty() {
+        return Err(DistributedRuntimeError::NoWorkersConfigured);
+    }
+    if node_count == 0 {
+        return Err(DistributedRuntimeError::InvalidNodePartition {
+            node_count,
+            worker_count: workers.len(),
         });
     }
 
-    match response.payload {
-        WorkerResponsePayload::Error(error) => Err(DistributedRuntimeError::WorkerError {
-            worker: worker.to_owned(),
-            message: error.message,
-        }),
-        payload => Ok(payload),
+    let shard_count = workers.len().min(node_count);
+    let base = node_count / shard_count;
+    let remainder = node_count % shard_count;
+    let mut start = 0usize;
+    let mut assignments = Vec::with_capacity(shard_count);
+
+    for (index, worker) in workers.iter().take(shard_count).enumerate() {
+        let shard_len = base + usize::from(index < remainder);
+        let end = start + shard_len;
+        assignments.push((worker.clone(), start..end));
+        start = end;
     }
+
+    Ok(assignments)
 }
 
 fn write_message<T: Serialize>(
@@ -687,17 +1104,29 @@ fn write_message<T: Serialize>(
         })
 }
 
-fn read_message<T: DeserializeOwned>(
+fn try_read_message<T: DeserializeOwned>(
     stream: &mut TcpStream,
     context: &str,
-) -> Result<T, DistributedRuntimeError> {
+) -> Result<Option<T>, DistributedRuntimeError> {
     let mut length_bytes = [0u8; 8];
+    match stream.read(&mut length_bytes[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(1) => {}
+        Ok(_) => unreachable!("single-byte read should produce at most one byte"),
+        Err(source) => {
+            return Err(DistributedRuntimeError::Transport {
+                context: context.to_owned(),
+                source,
+            });
+        }
+    }
     stream
-        .read_exact(&mut length_bytes)
+        .read_exact(&mut length_bytes[1..])
         .map_err(|source| DistributedRuntimeError::Transport {
             context: context.to_owned(),
             source,
         })?;
+
     let length = u64::from_be_bytes(length_bytes);
     if length > MAX_MESSAGE_BYTES as u64 {
         return Err(DistributedRuntimeError::MessageTooLarge {
@@ -713,179 +1142,17 @@ fn read_message<T: DeserializeOwned>(
             source,
         })?;
 
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-fn validate_shard(shard: ShardRange, dataset_len: usize) -> Result<(), DistributedRuntimeError> {
-    if shard.start >= shard.end || shard.end > dataset_len {
-        return Err(DistributedRuntimeError::InvalidShard {
-            start: shard.start,
-            end: shard.end,
-            dataset_len,
-        });
-    }
-
-    Ok(())
-}
-
-fn partition_shards(
-    workers: &[String],
-    sample_count: usize,
-) -> Result<Vec<(String, ShardRange)>, DistributedRuntimeError> {
-    if workers.is_empty() {
-        return Err(DistributedRuntimeError::NoWorkersConfigured);
-    }
-    if sample_count == 0 {
-        return Err(DistributedRuntimeError::NoWorkerResults);
-    }
-
-    let shard_count = workers.len().min(sample_count);
-    let base = sample_count / shard_count;
-    let remainder = sample_count % shard_count;
-    let mut start = 0usize;
-    let mut shards = Vec::with_capacity(shard_count);
-
-    for (index, worker) in workers.iter().take(shard_count).enumerate() {
-        let shard_len = base + usize::from(index < remainder);
-        let end = start + shard_len;
-        shards.push((worker.clone(), ShardRange { start, end }));
-        start = end;
-    }
-
-    Ok(shards)
-}
-
-fn aggregate_experiment_goodness(
-    reports: &[WorkerTrainShardResponse],
-) -> Result<ExperimentGoodness, DistributedRuntimeError> {
-    if reports.is_empty() {
-        return Err(DistributedRuntimeError::NoWorkerResults);
-    }
-
-    let positive_samples = reports
-        .iter()
-        .map(|report| report.experiment_goodness.positive_samples)
-        .sum::<usize>();
-    let negative_samples = reports
-        .iter()
-        .map(|report| report.experiment_goodness.negative_samples)
-        .sum::<usize>();
-
-    if positive_samples == 0 || negative_samples == 0 {
-        return Err(DistributedRuntimeError::NoWorkerResults);
-    }
-
-    let positive_sum = reports
-        .iter()
-        .map(|report| {
-            report.experiment_goodness.positive_mean_world_goodness
-                * report.experiment_goodness.positive_samples as f32
-        })
-        .sum::<f32>();
-    let negative_sum = reports
-        .iter()
-        .map(|report| {
-            report.experiment_goodness.negative_mean_world_goodness
-                * report.experiment_goodness.negative_samples as f32
-        })
-        .sum::<f32>();
-    let positive_mean_world_goodness = positive_sum / positive_samples as f32;
-    let negative_mean_world_goodness = negative_sum / negative_samples as f32;
-
-    Ok(ExperimentGoodness {
-        positive_mean_world_goodness,
-        negative_mean_world_goodness,
-        goodness_separation: positive_mean_world_goodness - negative_mean_world_goodness,
-        positive_samples,
-        negative_samples,
+fn read_message<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    context: &str,
+) -> Result<T, DistributedRuntimeError> {
+    try_read_message(stream, context)?.ok_or_else(|| DistributedRuntimeError::Transport {
+        context: context.to_owned(),
+        source: io::Error::new(ErrorKind::UnexpectedEof, "connection closed"),
     })
-}
-
-fn average_checkpoints(
-    checkpoints: &[GraphCheckpoint],
-) -> Result<GraphCheckpoint, DistributedRuntimeError> {
-    let mut averaged = checkpoints
-        .first()
-        .cloned()
-        .ok_or(DistributedRuntimeError::NoWorkerResults)?;
-    let worker_count = checkpoints.len() as f32;
-
-    for checkpoint in checkpoints.iter().skip(1) {
-        if checkpoint.format_version != averaged.format_version {
-            return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-                node: 0,
-                reason: "format version mismatch",
-            });
-        }
-        if checkpoint.phase != averaged.phase {
-            return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-                node: 0,
-                reason: "simulation phase mismatch",
-            });
-        }
-        if checkpoint.nodes.len() != averaged.nodes.len() {
-            return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-                node: 0,
-                reason: "node count mismatch",
-            });
-        }
-
-        for (node_index, (left, right)) in averaged
-            .nodes
-            .iter_mut()
-            .zip(checkpoint.nodes.iter())
-            .enumerate()
-        {
-            ensure_checkpoint_node_compatible(node_index, left, right)?;
-            left.activation += right.activation;
-            for slot in 0..left.local_weights.neighbor_weights.len() {
-                left.local_weights.neighbor_weights[slot] +=
-                    right.local_weights.neighbor_weights[slot];
-            }
-        }
-    }
-
-    for node in &mut averaged.nodes {
-        node.activation /= worker_count;
-        for weight in &mut node.local_weights.neighbor_weights {
-            *weight /= worker_count;
-        }
-    }
-
-    Ok(averaged)
-}
-
-fn ensure_checkpoint_node_compatible(
-    node_index: usize,
-    left: &GraphNodeCheckpoint,
-    right: &GraphNodeCheckpoint,
-) -> Result<(), DistributedRuntimeError> {
-    if left.index != right.index {
-        return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-            node: node_index,
-            reason: "stable node index mismatch",
-        });
-    }
-    if left.is_input != right.is_input {
-        return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-            node: node_index,
-            reason: "input-node marker mismatch",
-        });
-    }
-    if left.topology != right.topology {
-        return Err(DistributedRuntimeError::IncompatibleCheckpoint {
-            node: node_index,
-            reason: "topology mismatch",
-        });
-    }
-
-    Ok(())
-}
-
-impl ShardRange {
-    fn range(self) -> Range<usize> {
-        self.start..self.end
-    }
 }
 
 #[cfg(test)]
@@ -893,11 +1160,12 @@ mod tests {
     use super::*;
     use crate::ecs_runtime::checkpoint::StableTopologyPointers;
     use crate::ecs_runtime::components::LocalWeights;
-    use crate::ecs_runtime::ingestion_system::SimulationPhase;
+
+    const EPSILON: f32 = 1.0e-6;
 
     #[test]
-    fn partitions_samples_without_empty_shards() {
-        let shards = partition_shards(
+    fn partitions_nodes_without_empty_shards() {
+        let assignments = partition_node_ranges(
             &[
                 "worker-a:7000".to_owned(),
                 "worker-b:7000".to_owned(),
@@ -905,88 +1173,88 @@ mod tests {
             ],
             5,
         )
-        .expect("partition shards");
+        .expect("partition node ranges");
 
-        assert_eq!(shards.len(), 3);
-        assert_eq!(shards[0].1, ShardRange { start: 0, end: 2 });
-        assert_eq!(shards[1].1, ShardRange { start: 2, end: 4 });
-        assert_eq!(shards[2].1, ShardRange { start: 4, end: 5 });
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments[0].1, 0..2);
+        assert_eq!(assignments[1].1, 2..4);
+        assert_eq!(assignments[2].1, 4..5);
     }
 
     #[test]
-    fn averages_worker_checkpoints_elementwise() {
-        let left = GraphCheckpoint {
-            format_version: 1,
-            phase: SimulationPhase::Positive,
-            nodes: vec![GraphNodeCheckpoint {
-                index: 0,
-                activation: 2.0,
-                is_input: true,
-                local_weights: LocalWeights::new([1.0, 3.0, 5.0]),
-                topology: StableTopologyPointers::new([0, 0, 0]),
-            }],
-        };
-        let right = GraphCheckpoint {
-            format_version: 1,
-            phase: SimulationPhase::Positive,
-            nodes: vec![GraphNodeCheckpoint {
-                index: 0,
-                activation: 4.0,
-                is_input: true,
-                local_weights: LocalWeights::new([3.0, 5.0, 7.0]),
-                topology: StableTopologyPointers::new([0, 0, 0]),
-            }],
-        };
+    fn worker_shard_state_updates_forward_activation_and_weights() {
+        let mut shard = WorkerShardState::initialize(vec![GraphNodeCheckpoint {
+            index: 0,
+            activation: 0.0,
+            is_input: false,
+            local_weights: LocalWeights::new([0.5, -0.25, 0.1]),
+            topology: StableTopologyPointers::new([1, 2, 3]),
+        }])
+        .expect("initialize shard");
+        let neighbor_activations = [1.0, -0.5, 0.25];
 
-        let averaged = average_checkpoints(&[left, right]).expect("average checkpoints");
+        let activation = shard
+            .forward_node(ForwardNodeRequest {
+                node_index: 0,
+                neighbor_activations,
+                activation_kind: ActivationKind::Relu,
+            })
+            .expect("forward node")
+            .activation;
+        assert!((activation - 0.65).abs() < EPSILON);
 
-        assert_eq!(averaged.nodes[0].activation, 3.0);
-        assert_eq!(
-            averaged.nodes[0].local_weights.neighbor_weights,
-            [2.0, 4.0, 6.0]
-        );
+        let response = shard
+            .update_weights_batch(UpdateWeightsBatchRequest {
+                updates: vec![WeightUpdateNodeRequest {
+                    node_index: 0,
+                    neighbor_activations,
+                    phase: SimulationPhase::Positive,
+                    learning_rate: 0.1,
+                }],
+            })
+            .expect("update weights");
+        let weights = response.updates[0].neighbor_weights;
+
+        assert!((weights[0] - 0.612_775).abs() < EPSILON);
+        assert!((weights[1] + 0.306_387_5).abs() < EPSILON);
+        assert!((weights[2] - 0.128_193_75).abs() < EPSILON);
     }
 
     #[test]
-    fn aggregates_weighted_worker_goodness() {
-        let aggregated = aggregate_experiment_goodness(&[
-            WorkerTrainShardResponse {
-                checkpoint: sample_checkpoint(),
-                experiment_goodness: ShardExperimentMetrics {
-                    positive_mean_world_goodness: 2.0,
-                    negative_mean_world_goodness: 1.0,
-                    positive_samples: 2,
-                    negative_samples: 2,
-                },
-            },
-            WorkerTrainShardResponse {
-                checkpoint: sample_checkpoint(),
-                experiment_goodness: ShardExperimentMetrics {
-                    positive_mean_world_goodness: 4.0,
-                    negative_mean_world_goodness: 3.0,
-                    positive_samples: 1,
-                    negative_samples: 1,
-                },
-            },
-        ])
-        .expect("aggregate experiment goodness");
+    fn worker_protocol_round_trips_over_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = thread::spawn(move || {
+            let (stream, peer) = listener.accept().expect("accept connection");
+            handle_worker_connection(stream, &peer.to_string()).expect("serve connection");
+        });
 
-        assert!((aggregated.positive_mean_world_goodness - (8.0 / 3.0)).abs() < 1.0e-6);
-        assert!((aggregated.negative_mean_world_goodness - (5.0 / 3.0)).abs() < 1.0e-6);
-        assert!((aggregated.goodness_separation - 1.0).abs() < 1.0e-6);
-    }
-
-    fn sample_checkpoint() -> GraphCheckpoint {
-        GraphCheckpoint {
-            format_version: 1,
-            phase: SimulationPhase::Positive,
-            nodes: vec![GraphNodeCheckpoint {
+        let mut client = PartitionedWorkerClient::connect(
+            addr.to_string(),
+            0..1,
+            vec![GraphNodeCheckpoint {
                 index: 0,
                 activation: 0.0,
                 is_input: true,
-                local_weights: LocalWeights::filled(0.0),
+                local_weights: LocalWeights::new([1.0, 0.0, 0.0]),
                 topology: StableTopologyPointers::new([0, 0, 0]),
             }],
-        }
+        )
+        .expect("connect worker client");
+
+        client
+            .set_node_activations(vec![NodeActivationPatch {
+                node_index: 0,
+                activation: 2.0,
+            }])
+            .expect("set activation");
+        let activation = client
+            .forward_node(0, [1.5, 0.0, 0.0], ActivationKind::Relu)
+            .expect("forward node");
+
+        assert_eq!(activation, 1.5);
+
+        drop(client);
+        handle.join().expect("join worker thread");
     }
 }

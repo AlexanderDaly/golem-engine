@@ -345,7 +345,7 @@ Experiment management:
   --eval-every <N>           Run the no-learning FF evaluation every N epochs (default: {DEFAULT_EVAL_EVERY})
   --load-checkpoint <PATH>   Restore a previously saved graph state instead of generating a new graph
   --save-checkpoint <PATH>   Persist the final graph state after training
-  --distributed-worker <A>   Remote worker address (repeatable) for distributed federated averaging
+  --distributed-worker <A>   Remote worker address (repeatable) for partitioned distributed execution
 
 Training options:
   --epochs <N>               Number of epochs to run for this invocation (default: {DEFAULT_EPOCHS})
@@ -379,8 +379,8 @@ Input semantics:
   label-conditioned training requires graph_node_count >= 794.
 
 Distributed execution:
-  distributed mode snapshots the world once per epoch, sends identical checkpoints to remote workers, and averages the worker-updated worlds back on the coordinator.
-  every worker must be able to read the same dataset paths passed to --train-images/--train-labels and --test-images/--test-labels."
+  distributed mode partitions the graph across remote workers and drives the asynchronous Forward-Forward tick schedule over that shared world.
+  checkpoints, metrics, and manifests are still written by the coordinator."
     );
 }
 
