@@ -1,0 +1,22 @@
+{
+  "grpc_addr": "127.0.0.1:50051",
+  "http_addr": "127.0.0.1:8080",
+  "max_frame_bytes": 1048576,
+  "max_clock_skew_seconds": 300,
+  "allowed_packages": ["com.example.calculator"],
+  "device_keys": [
+    {
+      "device_id": "test-device-001",
+      "key_id": "test-key-001",
+      "public_key_base64": "KFWuoKPshENP20KtYp10nCAFW3ifoGSoGo36lH94LQk="
+    }
+  ],
+  "storage_jsonl_path": "server/testdata/sanitized-dev.jsonl",
+  "mtls": {
+    "enabled": false,
+    "cert_file": "",
+    "key_file": "",
+    "client_ca_file": "",
+    "require_client_cert": false
+  }
+}
