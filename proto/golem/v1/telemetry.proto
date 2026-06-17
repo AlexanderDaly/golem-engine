@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package golem.v1;
+
+option go_package = "github.com/internal/golem-harness/server/internal/pb/golem/v1;golemv1";
+
+// Phase 1 telemetry contract for sanitized, replayable Android trajectories.
+// Raw screenshots, raw text, raw content descriptions, raw XML, credentials, and
+// PII are intentionally excluded from persisted fields.
+message TelemetryFrame {
+  uint32 protocol_version = 1;
+  string trajectory_id = 2;
+  string frame_id = 3;
+  uint64 sequence_number = 4;
+  int64 event_unix_millis = 5;
+
+  DeviceMetadata device = 10;
+  AppContext app = 11;
+  UITreeSnapshot ui_tree = 12;
+  IntentMetadata intent = 13;
+  ActionMetadata action = 14;
+  UISettleMetadata ui_settle = 15;
+  ScreenshotReference screenshot = 16;
+  SanitizerMetadata sanitizer = 17;
+  SignatureEnvelope signature = 18;
+
+  // Pre-storage only extension point. Implementations must not persist values
+  // carried here unless a sanitizer explicitly transforms them into safe fields.
+  map<string, string> pre_storage_only = 100;
+}
+
+message DeviceMetadata {
+  string device_id = 1;
+  uint32 android_sdk_version = 2;
+  string build_fingerprint_hash = 3;
+  string redacted_build_metadata = 4;
+}
+
+message AppContext {
+  string foreground_package = 1;
+  string foreground_activity = 2;
+  AllowlistDecision allowlist_decision = 3;
+}
+
+message AllowlistDecision {
+  enum Decision {
+    DECISION_UNSPECIFIED = 0;
+    ACCEPT = 1;
+    DROP = 2;
+    QUARANTINE = 3;
+  }
+  Decision decision = 1;
+  string policy_version = 2;
+  repeated string reason_codes = 3;
+  string kill_switch_reason = 4;
+}
+
+message UITreeSnapshot {
+  string snapshot_id = 1;
+  repeated UINode nodes = 2;
+  string tree_hash = 3;
+}
+
+message UINode {
+  string stable_node_id = 1;
+  Bounds bounds = 2;
+  string class_name = 3;
+  string package_name = 4;
+  string resource_id_hash = 5;
+  RedactedValue text = 6;
+  RedactedValue content_description = 7;
+  bool clickable = 8;
+  bool enabled = 9;
+  bool focused = 10;
+  bool selected = 11;
+  bool checkable = 12;
+}
+
+message Bounds {
+  int32 left = 1;
+  int32 top = 2;
+  int32 right = 3;
+  int32 bottom = 4;
+}
+
+message RedactedValue {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    HASHED = 1;
+    REDACTED = 2;
+    DROPPED = 3;
+    ABSENT = 4;
+    PRE_STORAGE_ONLY = 5;
+  }
+  Status status = 1;
+  string hash = 2;
+  repeated string redaction_rule_ids = 3;
+}
+
+message IntentMetadata {
+  string intent_id = 1;
+  string operator_intent_hash = 2;
+  repeated string allowed_action_families = 3;
+}
+
+message ActionMetadata {
+  string action_id = 1;
+  string action_type = 2;
+  string target_stable_node_id = 3;
+  string parameters_hash = 4;
+}
+
+message UISettleMetadata {
+  bool observed = 1;
+  uint32 settle_timeout_millis = 2;
+  uint32 stable_window_millis = 3;
+  string heuristic_version = 4;
+}
+
+message ScreenshotReference {
+  bool present = 1;
+  string sanitized_artifact_id = 2;
+  string perceptual_hash = 3;
+  repeated RedactionBox redaction_boxes = 4;
+}
+
+message RedactionBox {
+  int32 left = 1;
+  int32 top = 2;
+  int32 right = 3;
+  int32 bottom = 4;
+  string reason_code = 5;
+}
+
+message SanitizerMetadata {
+  string sanitizer_version = 1;
+  repeated string redaction_rules_applied = 2;
+  repeated string fields_dropped = 3;
+  repeated string reason_codes = 4;
+}
+
+message SignatureEnvelope {
+  string key_id = 1;
+  string algorithm = 2; // Ed25519 in Phase 1.
+  bytes signature = 3;
+  int64 signed_at_unix_millis = 4;
+  string canonicalization = 5;
+}
